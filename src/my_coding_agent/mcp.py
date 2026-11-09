@@ -1,0 +1,269 @@
+"""MCP 客户端（产品层）—— 原生异步 Stdio 子进程连接与 extension 入口。"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import mcp.types as mcp_types  # pyright: ignore[reportMissingImports]
+from mcp.client.session import ClientSession  # pyright: ignore[reportMissingImports]
+from mcp.client.stdio import (  # pyright: ignore[reportMissingImports]
+    StdioServerParameters,
+    stdio_client,
+)
+from my_agent_core.tools import (  # pyright: ignore[reportMissingImports]
+    Tool,
+    ToolResult,
+)
+
+if TYPE_CHECKING:
+    from my_agent_core.extensions import (  # pyright: ignore[reportMissingImports]
+        ExtensionAPI,
+    )
+
+
+@dataclass
+class MCPServerConfig:
+    name: str
+    command: str
+    args: list[str]
+    env: dict[str, str] | None = None
+
+
+class MCPConnection:
+    """单个 MCP Server 的原生异步连接管理器。"""
+
+    def __init__(self, config: MCPServerConfig):
+        self.config = config
+        self._session: ClientSession | None = None
+        self._runner_task: asyncio.Task[None] | None = None
+        self._ready_event = asyncio.Event()
+        self._stop_event = asyncio.Event()
+        self._error: Exception | None = None
+
+    async def _run(self) -> None:
+        try:
+            server_env = os.environ.copy()
+            if self.config.env:
+                server_env.update(self.config.env)
+
+            params = StdioServerParameters(
+                command=self.config.command,
+                args=self.config.args,
+                env=server_env,
+            )
+
+            async with stdio_client(params) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    self._session = session
+                    self._ready_event.set()
+                    await self._stop_event.wait()
+        except Exception as exc:
+            self._error = exc
+            self._ready_event.set()
+        finally:
+            self._session = None
+
+    async def start(self) -> None:
+        """在专用长生命周期后台 Task 中建立 Stdio 子进程长连接并完成初始化握手。"""
+        self._ready_event.clear()
+        self._stop_event.clear()
+        self._error = None
+        self._runner_task = asyncio.create_task(self._run())
+        await self._ready_event.wait()
+        if self._error is not None:
+            raise self._error
+
+    async def list_tools(self) -> list[mcp_types.Tool]:
+        """异步拉取远程工具列表。"""
+        if self._session is None:
+            raise RuntimeError(f"MCP server '{self.config.name}' is not connected")
+        res = await self._session.list_tools()
+        return res.tools
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        """异步调用远程工具。"""
+        if self._session is None:
+            return ToolResult(
+                ok=False,
+                error=f"MCP server '{self.config.name}' is not connected",
+                meta={"server": self.config.name},
+            )
+
+        try:
+            call_res = await self._session.call_tool(name=name, arguments=arguments)
+        except Exception as exc:
+            return ToolResult(
+                ok=False,
+                error=f"MCP tool '{name}' failed: {exc}",
+                meta={"server": self.config.name},
+            )
+
+        # 拼接文本输出
+        texts = []
+        for content in call_res.content:
+            text_val = getattr(content, "text", None)
+            if text_val is not None:
+                texts.append(str(text_val))
+            else:
+                texts.append(str(content))
+        out_text = "\n".join(texts) or "(no output)"
+
+        is_err = getattr(call_res, "is_error", getattr(call_res, "isError", False))
+        if is_err:
+            return ToolResult(
+                ok=False,
+                error=out_text,
+                meta={"server": self.config.name, "is_error": True},
+            )
+        return ToolResult(ok=True, data=out_text, meta={"server": self.config.name})
+
+    async def close(self) -> None:
+        """优雅关闭。"""
+        self._stop_event.set()
+        if self._runner_task and not self._runner_task.done():
+            try:
+                await asyncio.wait_for(self._runner_task, timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                self._runner_task.cancel()
+        self._session = None
+
+
+class MCPClientManager:
+    """多 MCP Server 管理器。"""
+
+    def __init__(self):
+        self.connections: dict[str, MCPConnection] = {}
+        self._tools: list[Tool] = []
+        self._configs: list[MCPServerConfig] = []
+
+    @classmethod
+    def from_config_file(cls, path: Path | str) -> MCPClientManager:
+        """从配置文件构造 MCPClientManager 实例。"""
+        mgr = cls()
+        mgr._configs = mgr.load_config(path)
+        return mgr
+
+    def load_config(self, path: Path | str) -> list[MCPServerConfig]:
+        """读取 .mcp.json。"""
+        p = Path(path)
+        if not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"Invalid JSON in {p}: {exc}") from exc
+
+        servers = data.get("mcpServers", {})
+        configs = []
+        for name, srv in servers.items():
+            cmd = srv.get("command", "")
+            if not cmd:
+                # 当前仅支持 stdio 命令行进程类型，跳过非 command 类型（如 http/sse）
+                continue
+            configs.append(
+                MCPServerConfig(
+                    name=name,
+                    command=cmd,
+                    args=srv.get("args", []),
+                    env=srv.get("env"),
+                )
+            )
+        self._configs = configs
+        return configs
+
+    async def connect_server(self, config: MCPServerConfig) -> list[Tool]:
+        """异步连接单个 Server 并返回包装后的 Tool 列表。"""
+        conn = MCPConnection(config)
+        await conn.start()
+        self.connections[config.name] = conn
+
+        mcp_tools = await conn.list_tools()
+        wrapped_tools = []
+        for t in mcp_tools:
+            tool_name = t.name
+            schema = getattr(t, "input_schema", getattr(t, "inputSchema", {}))
+
+            def _make_handler(target_conn: MCPConnection, target_name: str):
+                async def _handler(args: dict[str, Any]) -> ToolResult:
+                    return await target_conn.call_tool(target_name, args)
+
+                return _handler
+
+            wrapped = Tool(
+                func=_make_handler(conn, tool_name),
+                name=tool_name,
+                description=t.description or "",
+                raw_schema=schema,
+                timeout=120.0,
+                is_parallel_safe=False,
+                is_mcp=True,
+            )
+            wrapped_tools.append(wrapped)
+        self._tools.extend(wrapped_tools)
+        return wrapped_tools
+
+    async def connect_all(self, configs: list[MCPServerConfig] | None = None) -> list[Tool]:
+        """连接所有配置的服务并返回收集的所有工具。"""
+        target_configs = configs if configs is not None else self._configs
+        tools: list[Tool] = []
+        for cfg in target_configs:
+            server_tools = await self.connect_server(cfg)
+            tools.extend(server_tools)
+        return tools
+
+    def get_all_tools(self) -> list[Tool]:
+        """获取当前所有已连接的工具列表。"""
+        return list(self._tools)
+
+    async def close_all(self) -> None:
+        """异步关闭所有连接。"""
+        for conn in self.connections.values():
+            with contextlib.suppress(Exception):
+                await conn.close()
+        self.connections.clear()
+        self._tools.clear()
+
+
+# ── 标准 Extension 入口协议 ──────────────────────────────────────────
+
+
+async def extension(api: ExtensionAPI) -> None:
+    """MCP Extension 标准入口函数。"""
+    config_path = Path.cwd() / ".mcp.json"
+    if not config_path.exists():
+        return
+
+    manager = MCPClientManager()
+    try:
+        server_configs = manager.load_config(config_path)
+    except Exception as exc:
+        print(f"[MCP] 解析 .mcp.json 失败: {exc}")
+        return
+
+    registered_tools: list[str] = []
+    for cfg in server_configs:
+        try:
+            tools = await manager.connect_server(cfg)
+            for t in tools:
+                api.register_tool(t)
+                registered_tools.append(t.name)
+        except Exception as exc:
+            print(f"[MCP] 连接服务 '{cfg.name}' 失败: {exc}")
+
+    @api.command("mcp", description="查看当前已连接的 MCP 服务状态与工具列表")
+    def cmd_mcp(args: str | None = None) -> str:
+        if not manager.connections:
+            return "当前未连接任何 MCP 服务。"
+        lines = ["=== MCP 服务状态 ==="]
+        for name, conn in manager.connections.items():
+            status = "Connected" if conn._session is not None else "Disconnected"
+            lines.append(f"- {name}: {status} (命令: {conn.config.command})")
+        lines.append(f"已加载工具: {', '.join(registered_tools) or '(none)'}")
+        return "\n".join(lines)

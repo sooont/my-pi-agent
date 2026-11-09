@@ -1,0 +1,835 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { InteractiveMode } from "../dist/interactive/interactive-mode.js";
+import { KernelBridge } from "../dist/bridge/kernel-bridge.js";
+import { isEnterKey } from "../dist/components/keys.js";
+
+function createMockBridge() {
+  const listeners = [];
+  const calls = [];
+  const fakeClient = {
+    request: async (method, params) => {
+      calls.push({ method, params });
+      if (method === "models_list") {
+        return {
+          models: [
+            { id: "gpt-4o", provider: "openai" },
+            { id: "deepseek-chat", provider: "deepseek" },
+          ],
+        };
+      }
+      if (method === "session_list") {
+        return {
+          sessions: [
+            {
+              session_id: "s-1",
+              title: "Test Session",
+              updated_at: Date.now(),
+            },
+          ],
+        };
+      }
+      if (method === "session_stats") {
+        return {
+          status: "ok",
+          stats: {
+            sessionFile: "C:\\test\\session.jsonl",
+            sessionId: "s-12345",
+            totalMessages: 10,
+            userMessages: 4,
+            assistantMessages: 4,
+            toolCalls: 2,
+            toolResults: 2,
+            tokens: {
+              input: 1000,
+              output: 200,
+              cacheRead: 500,
+              cacheWrite: 0,
+              total: 1200,
+            },
+            cost: 0.05,
+          },
+        };
+      }
+      return { status: "ok" };
+    },
+    on: () => {},
+  };
+  const bridge = new KernelBridge(fakeClient);
+  bridge.subscribe = (fn) => {
+    listeners.push(fn);
+    return () => {};
+  };
+  return { bridge, listeners, calls };
+}
+
+test("InteractiveMode initializes component hierarchy and viewport", () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge, {
+    workspace: "/test/workspace",
+    model: "gpt-4o",
+    sessionName: "init-test",
+  });
+
+  assert.ok(mode.ui);
+  assert.ok(mode.chatContainer);
+  assert.ok(mode.footer);
+  assert.ok(mode.header);
+  assert.equal(mode.currentModelName, "gpt-4o");
+});
+
+test("InteractiveMode handles agent streaming events without throwing", () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+
+  mode.handleAgentEvent({ type: "agent_start" });
+  assert.equal(mode.isStreaming, true);
+
+  mode.handleAgentEvent({
+    type: "message_start",
+    message: { role: "assistant", content: [] },
+  });
+  assert.ok(mode.currentStreamingAssistant);
+
+  mode.handleAgentEvent({
+    type: "message_update",
+    message: {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Step 1" },
+        { type: "text", text: "Hello!" },
+      ],
+    },
+  });
+
+  mode.handleAgentEvent({
+    type: "tool_execution_start",
+    toolCallId: "call-1",
+    toolName: "read",
+    args: { path: "test.py" },
+  });
+  assert.equal(mode.activeToolCalls.size, 1);
+
+  mode.handleAgentEvent({
+    type: "tool_execution_end",
+    toolCallId: "call-1",
+    result: "content",
+    isError: false,
+  });
+  assert.equal(mode.activeToolCalls.get("call-1")?.finished, true);
+
+  mode.handleAgentEvent({
+    type: "message_end",
+    message: { role: "assistant", content: [] },
+  });
+  assert.equal(mode.currentStreamingAssistant, undefined);
+
+  mode.handleAgentEvent({ type: "agent_end" });
+  assert.equal(mode.isStreaming, false);
+  assert.equal(mode.activeToolCalls.size, 0);
+});
+
+test("InteractiveMode does not duplicate UserMessageComponent when message_start arrives for normal prompt", async () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+
+  // 用户提交普通 prompt
+  await mode.handleUserInput("为什么显示两次");
+
+  // 此时 chatContainer 中应有 1 个 UserMessageComponent
+  const userMsgCount1 = mode.chatContainer.children.filter(
+    (c) => c.constructor.name === "UserMessageComponent",
+  ).length;
+  assert.equal(userMsgCount1, 1);
+
+  // 内核发回 message_start(role="user")
+  mode.handleAgentEvent({
+    type: "message_start",
+    message: { role: "user", content: "为什么显示两次" },
+  });
+
+  // 绝不能重复追加第二个 UserMessageComponent
+  const userMsgCount2 = mode.chatContainer.children.filter(
+    (c) => c.constructor.name === "UserMessageComponent",
+  ).length;
+  assert.equal(userMsgCount2, 1);
+});
+
+test("InteractiveMode preserves image markers and does not echo user completion as an assistant", async () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+  const text = "[image 2]里面说了什么？";
+  const content = [
+    { type: "image", data: "aGVsbG8=", mime_type: "image/png" },
+    { type: "text", text: "里面说了什么？" },
+  ];
+  await mode.handleUserInput(text, content);
+  for (const type of ["message_start", "message_end"]) {
+    mode.handleAgentEvent(bridge.translator.translate({ type, message: { role: "user", content } }));
+  }
+  const userMessages = mode.chatContainer.children.filter((c) => c.constructor.name === "UserMessageComponent");
+  assert.equal(userMessages.length, 1);
+  assert.equal(userMessages[0].text, text);
+  assert.equal(mode.chatContainer.children.some((c) => c.constructor.name === "AssistantMessageComponent"), false);
+});
+
+test("InteractiveMode showSelector lifecycle handles mount and cleanup", () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+
+  let doneCb;
+  mode.showSelector((done) => {
+    doneCb = done;
+    return {
+      component: { render: () => ["selector"] },
+      focus: {},
+    };
+  });
+
+  assert.ok(mode.activeSelectorComponent);
+  doneCb();
+  assert.equal(mode.activeSelectorComponent, undefined);
+});
+
+test("InteractiveMode handles slash commands (/clear, /help, /model, /thinking)", async () => {
+  const { bridge, calls } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+
+  await mode.handleSlashCommand("/help");
+  await mode.handleSlashCommand("/model gpt-4o");
+  assert.equal(mode.currentModelName, "gpt-4o");
+  assert.ok(calls.some((c) => c.method === "model_switch"));
+
+  await mode.handleSlashCommand("/thinking high");
+  assert.equal(mode.currentThinkingLevel, "high");
+  assert.ok(calls.some((c) => c.method === "thinking_set"));
+
+  await mode.handleSlashCommand("/clear");
+});
+
+test("InteractiveMode streaming prevents quadratic text and thinking duplication", () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+
+  mode.handleAgentEvent({ type: "agent_start" });
+  mode.handleAgentEvent({
+    type: "message_start",
+    message: { role: "assistant", content: [] },
+  });
+
+  // 模拟流式第 1 个 chunk (思考过程)
+  mode.handleAgentEvent({
+    type: "message_update",
+    message: {
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "Step 1" }],
+    },
+  });
+
+  // 模拟流式第 2 个 chunk (思考累计完成)
+  mode.handleAgentEvent({
+    type: "message_update",
+    message: {
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "Step 1 & Step 2" }],
+    },
+  });
+
+  // 模拟流式第 3 个 chunk (正文开始输出，同时带有累计思考)
+  mode.handleAgentEvent({
+    type: "message_update",
+    message: {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Step 1 & Step 2" },
+        { type: "text", text: "Hello" },
+      ],
+    },
+  });
+
+  // 模拟流式第 4 个 chunk (正文累加)
+  mode.handleAgentEvent({
+    type: "message_update",
+    message: {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Step 1 & Step 2" },
+        { type: "text", text: "Hello world" },
+      ],
+    },
+  });
+
+  const assistant = mode.currentStreamingAssistant;
+  assert.ok(assistant);
+  assert.equal(assistant["contentText"], "Hello world");
+  assert.equal(assistant["thinkingText"], "Step 1 & Step 2");
+});
+
+test("InteractiveMode renders session history with structured array content safely", () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+
+  // 用户与助手消息均包含结构化块数组
+  mode.renderSessionHistory([
+    {
+      role: "user",
+      content: [{ type: "text", text: "Hello from structured user message" }],
+    },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Thinking about structured response" },
+        { type: "text", text: "Structured assistant response text" },
+      ],
+    },
+  ]);
+
+  const rendered = mode.ui.render(80).join("\n");
+  assert.ok(rendered.includes("Hello from structured user message"));
+  assert.ok(rendered.includes("Structured assistant response text"));
+});
+
+test("InteractiveMode guards against concurrent submission and session commands during streaming", async () => {
+  const { bridge, calls } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+
+  mode.isStreaming = true;
+
+  // 运行中普通文本输入自动转为即时转向 (Steering) 并挂载到 Pending 区域
+  await mode.handleUserInput("Test input while streaming");
+  const rendered = mode.ui.render(80).join("\n");
+  assert.ok(rendered.includes("Steering: Test input while streaming"));
+  assert.equal(calls.at(-1)?.method, "steer");
+
+  // 运行中管理/破坏性命令被拦截
+  await mode.handleUserInput("/new");
+  const renderedAfterNew = mode.ui.render(80).join("\n");
+  assert.ok(
+    renderedAfterNew.includes("当前智能体正在执行中"),
+  );
+});
+
+test("isEnterKey matches return, enter, carriage returns, and CRLF across platforms", () => {
+  assert.equal(isEnterKey("\r"), true);
+  assert.equal(isEnterKey("\n"), true);
+  assert.equal(isEnterKey("\r\n"), true);
+  assert.equal(isEnterKey("a"), false);
+  assert.equal(isEnterKey("\t"), false);
+  assert.equal(isEnterKey("\x1b"), false);
+});
+
+test("InteractiveMode slash commands (/model fuzzy, /thinking validation, /session stats, /copy, /hotkeys, /name)", async () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+
+  // 1. /thinking 有效等级
+  await mode.handleSlashCommand("/thinking high");
+  assert.equal(mode.currentThinkingLevel, "high");
+
+  // 2. /thinking 无效等级 -> 提示错误，不污染状态
+  await mode.handleSlashCommand("/thinking invalid_level");
+  assert.equal(mode.currentThinkingLevel, "high");
+  const renderedThinkingErr = mode.ui.render(80).join("\n");
+  assert.ok(renderedThinkingErr.includes("未知思考等级"));
+
+  // 3. /name 无参查询
+  await mode.handleSlashCommand("/name");
+  const renderedNameQuery = mode.ui.render(80).join("\n");
+  assert.ok(renderedNameQuery.includes("当前会话名称"));
+
+  // 4. /session 无参展示指标看板 (对标 Pi 官方 Session Info)
+  await mode.handleSlashCommand("/session");
+  const renderedSessionStats = mode.ui.render(80).join("\n");
+  assert.ok(renderedSessionStats.includes("Session Info"));
+  assert.ok(renderedSessionStats.includes("Messages"));
+  assert.ok(renderedSessionStats.includes("Tokens"));
+
+  // 5. /hotkeys 快捷键清单
+  await mode.handleSlashCommand("/hotkeys");
+  const renderedHotkeys = mode.ui.render(80).join("\n");
+  assert.ok(renderedHotkeys.includes("常用键盘快捷键说明清单"));
+
+  // 6. /model 精确匹配
+  await mode.handleSlashCommand("/model gpt-4o");
+  assert.equal(mode.currentModelName, "gpt-4o");
+
+  // 7. /model 非精确匹配 -> 打开选择器预填搜索词，不直接改名
+  await mode.handleSlashCommand("/model deep");
+  assert.ok(mode.activeSelectorComponent);
+  assert.equal(mode.activeSelectorComponent.searchInput.getValue(), "deep");
+  mode.activeSelectorComponent.handleInput("\x1b"); // Esc 取消
+  assert.equal(mode.activeSelectorComponent, undefined);
+
+  // 8. /copy 命令 (无消息时报错)
+  await mode.handleSlashCommand("/copy");
+  const renderedCopy = mode.ui.render(80).join("\n");
+  assert.ok(renderedCopy.includes("当前暂无智能体消息可供复制"));
+});
+
+test("InteractiveMode handles Shift+Tab (\\x1b[Z) and Ctrl+T to cycle thinking level", async () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge, { model: "claude-3-7-sonnet" });
+  await mode.init();
+  assert.equal(mode.currentThinkingLevel, "off");
+
+  // 1. claude-3-7-sonnet: off -> minimal
+  mode.ui.handleTerminalInput("\x1b[Z");
+  assert.equal(mode.currentThinkingLevel, "minimal");
+
+  // 2. minimal -> low
+  mode.ui.handleTerminalInput("\x1b[Z");
+  assert.equal(mode.currentThinkingLevel, "low");
+
+  // 3. low -> medium
+  mode.ui.handleTerminalInput("\x1b[Z");
+  assert.equal(mode.currentThinkingLevel, "medium");
+
+  // 4. medium -> high
+  mode.ui.handleTerminalInput("\x1b[Z");
+  assert.equal(mode.currentThinkingLevel, "high");
+
+  // 5. high -> max
+  mode.ui.handleTerminalInput("\x14"); // Ctrl+T
+  assert.equal(mode.currentThinkingLevel, "max");
+
+  // 6. max -> off
+  mode.ui.handleTerminalInput("\x1b[Z");
+  assert.equal(mode.currentThinkingLevel, "off");
+
+  // 7. Non-reasoning model (gpt-4o): cannot cycle, stays off
+  mode.currentModelName = "gpt-4o";
+  mode.ui.handleTerminalInput("\x1b[Z");
+  assert.equal(mode.currentThinkingLevel, "off");
+});
+
+test("InteractiveMode renders error notice on message_end and agent_end when model errors", () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+
+  mode.handleAgentEvent({ type: "agent_start" });
+  mode.handleAgentEvent({ type: "turn_start", iteration: 1 });
+  mode.handleAgentEvent({
+    type: "message_start",
+    message: { role: "assistant", content: "" },
+  });
+
+  // 模拟模型抛出 401 认证异常结束消息
+  const authErrMsg =
+    "Error code: 401 - Authentication Fails, Your api key is invalid";
+  mode.handleAgentEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: authErrMsg,
+      metadata: { stop_reason: "error" },
+    },
+  });
+
+  mode.handleAgentEvent({
+    type: "agent_end",
+    stop_reason: "error",
+    final_text: authErrMsg,
+  });
+
+  // 验证错误信息已成功加入聊天气泡容器并对用户可见
+  const renderedText = mode.chatContainer.children
+    .map((c) => (c.render ? c.render(120).join("\n") : ""))
+    .join("\n");
+  assert.ok(
+    renderedText.includes("Authentication Fails"),
+    "Chat container must contain the 401 error message",
+  );
+  assert.ok(
+    renderedText.includes("⚠"),
+    "Chat container must contain the warning/error icon",
+  );
+});
+
+test("InteractiveMode /new command resets footer metrics and updates sessionName", async () => {
+  const { bridge } = createMockBridge();
+  bridge.client = {
+    sendRequest: async (method) => {
+      if (method === "session_new") {
+        return {
+          status: "ok",
+          session_id: "sid-brand-new-999",
+          session_name: "sid-brand-new-999",
+          context_window: 1000000,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            total: 0,
+            contextTokens: 0,
+            cost: 0,
+          },
+        };
+      }
+      return { status: "ok" };
+    },
+  };
+
+  const mode = new InteractiveMode(bridge);
+  // 先设置旧会话的累积指标
+  mode.footer.update({
+    sessionName: "old-session-2026",
+    inputTokens: 158000,
+    outputTokens: 4400,
+    contextTokens: 23936,
+    contextWindow: 128000,
+    costUsd: 0.028,
+  });
+
+  assert.equal(mode.footer.getSessionName(), "old-session-2026");
+
+  // 执行 /new 命令
+  await mode.handleUserInput("/new");
+
+  // 验证 footer 的 sessionName 和各项 token 指标已被彻底重置
+  assert.equal(mode.footer.getSessionName(), "sid-brand-new-999");
+  assert.equal(mode.footer.getContextWindow(), 1000000);
+  const footerLines = mode.footer.render(120).join("\n");
+  assert.ok(footerLines.includes("sid-brand-new-999"));
+  assert.ok(
+    footerLines.includes("0.0%/1.0M") || footerLines.includes("0.0%/1000k"),
+  );
+  assert.ok(!footerLines.includes("158k"));
+  assert.ok(!footerLines.includes("18.7%"));
+});
+
+test("CustomEditor tracks image attachments at their current text positions", () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+  const image = { data: "aGVsbG8=", mime_type: "image/png" };
+
+  mode.defaultEditor.setText("before");
+  mode.defaultEditor.insertImageAttachment(image);
+  const marker = "[image 1]";
+  assert.equal(mode.defaultEditor.getText(), `before${marker}`);
+  assert.deepEqual(mode.defaultEditor.getImageAttachments(), [
+    { marker, ...image, position: 6 },
+  ]);
+
+  mode.defaultEditor.setText(`before${marker} after`);
+  assert.equal(mode.defaultEditor.getImageAttachments()[0].position, 6);
+  mode.defaultEditor.setText("before after");
+  assert.deepEqual(mode.defaultEditor.getImageAttachments(), []);
+});
+
+test("InteractiveMode submits editor images as ordered content blocks", async () => {
+  const { bridge, calls } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+  mode.defaultEditor.setText("before");
+  mode.defaultEditor.insertImageAttachment({ data: "aGVsbG8=", mime_type: "image/png" });
+  mode.defaultEditor.insertTextAtCursor(" after");
+
+  mode.defaultEditor.handleInput("\r");
+  const request = calls.at(-1);
+  assert.equal(request?.method, "prompt");
+  assert.deepEqual(request?.params?.content, [
+    { type: "text", text: "before" },
+    { type: "image", data: "aGVsbG8=", mime_type: "image/png" },
+    { type: "text", text: " after" },
+  ]);
+  assert.equal(mode.defaultEditor.getText(), "");
+  assert.deepEqual(mode.defaultEditor.getImageAttachments(), []);
+});
+
+test("Enter submits image-only and expanded mixed content after the editor clears", () => {
+  const image = { type: "image", data: "aGVsbG8=", mime_type: "image/png" };
+  for (const text of ["", "long text ".repeat(120)]) {
+    const { bridge, calls } = createMockBridge();
+    const mode = new InteractiveMode(bridge);
+    const editor = mode.defaultEditor;
+    if (text) editor.handleInput(`\x1b[200~${text}\x1b[201~`);
+    editor.insertImageAttachment(image);
+    editor.handleInput("\r");
+    assert.equal(editor.getText(), "");
+    assert.deepEqual(calls.at(-1)?.params?.content, text
+      ? [{ type: "text", text }, image]
+      : [image]);
+  }
+});
+
+test("Ctrl+V reads clipboard image bytes and submits them", { skip: process.platform !== "linux" }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "my-pi-clipboard-"));
+  const originalPath = process.env.PATH;
+  try {
+    await writeFile(join(directory, "wl-paste"), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    await writeFile(join(directory, "xclip"), '#!/bin/sh\nprintf "clipboard image bytes"\n', { mode: 0o755 });
+    process.env.PATH = directory;
+    const { bridge, calls } = createMockBridge();
+    const mode = new InteractiveMode(bridge);
+    await mode.init();
+    const paste = mode.defaultEditor.pasteImageFromClipboard.bind(mode.defaultEditor);
+    let pasted;
+    mode.defaultEditor.pasteImageFromClipboard = () => (pasted = paste());
+    mode.defaultEditor.setText("before");
+    mode.ui.handleTerminalInput("\x16");
+    assert.equal(mode.defaultEditor.disableSubmit, true);
+    mode.defaultEditor.insertTextAtCursor("after");
+    assert.equal(await pasted, true);
+    assert.equal(mode.defaultEditor.disableSubmit, false);
+    mode.defaultEditor.handleInput("\r");
+    assert.deepEqual(calls.at(-1)?.params?.content, [
+      { type: "text", text: "before" },
+      { type: "image", data: Buffer.from("clipboard image bytes").toString("base64"), mime_type: "image/png" },
+      { type: "text", text: "after" },
+    ]);
+    await writeFile(join(directory, "xclip"), '#!/bin/sh\nexit 1\n');
+    mode.defaultEditor.setText("safe");
+    assert.equal(await mode.defaultEditor.pasteImageFromClipboard(), false);
+    assert.equal(mode.defaultEditor.getMessageContent(), "safe");
+    assert.equal(mode.defaultEditor.disableSubmit, false);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("CustomEditor preserves multiple images, repeated markers, and expanded text pastes", () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+  const editor = mode.defaultEditor;
+  const image = { type: "image", data: "aGVsbG8=", mime_type: "image/png" };
+  const longText = "long text ".repeat(120);
+  editor.handleInput(`\x1b[200~${longText}\x1b[201~`);
+  editor.insertImageAttachment(image);
+  editor.insertTextAtCursor("between");
+  editor.insertImageAttachment({ ...image, data: "d29ybGQ=" });
+  assert.deepEqual(editor.getMessageContent(), [
+    { type: "text", text: longText }, image,
+    { type: "text", text: "between" }, { ...image, data: "d29ybGQ=" },
+  ]);
+  editor.setText("[image 2]text[image 1][image 1]");
+  assert.deepEqual(editor.getMessageContent(), [
+    { ...image, data: "d29ybGQ=" }, { type: "text", text: "text" }, image, image,
+  ]);
+  editor.setText("");
+  editor.setText("[image 1]");
+  assert.deepEqual(editor.getMessageContent(), [image]);
+});
+
+test("InteractiveMode submits image-only input and preserves pure text submission", async () => {
+  const { bridge, calls } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+  const image = { type: "image", data: "aGVsbG8=", mime_type: "image/png" };
+  mode.defaultEditor.insertImageAttachment(image);
+  await mode.defaultEditor.onSubmit?.(mode.defaultEditor.getText());
+  assert.deepEqual(calls.at(-1)?.params?.content, [image]);
+  mode.defaultEditor.setText("  plain text  ");
+  await mode.defaultEditor.onSubmit?.(mode.defaultEditor.getText());
+  assert.deepEqual(calls.at(-1)?.params, { text: "plain text" });
+});
+
+for (const behavior of ["steer", "followup"]) {
+  test(`InteractiveMode keeps images through ${behavior} queue consumption and restoration`, async () => {
+    const { bridge, calls } = createMockBridge();
+    const mode = new InteractiveMode(bridge);
+    const content = [
+      { type: "text", text: "before" },
+      { type: "image", data: "aGVsbG8=", mime_type: "image/png" },
+      { type: "text", text: "after" },
+    ];
+    mode.isStreaming = true;
+    mode.defaultEditor.setMessageContent(content);
+    if (behavior === "steer") await mode.defaultEditor.onSubmit?.(mode.defaultEditor.getText());
+    else await mode.handleFollowUp();
+    assert.equal(calls.at(-1)?.method, behavior);
+    assert.deepEqual(calls.at(-1)?.params?.message, content);
+    const pending = behavior === "steer" ? mode.pendingSteeringList : mode.pendingFollowupList;
+    assert.deepEqual(pending, [content]);
+    mode.handleAgentEvent({ type: "message_start", message: { role: "user", content } });
+    assert.deepEqual(pending, []);
+
+    pending.push(content);
+    await mode.restoreQueuedMessagesToEditor();
+    assert.deepEqual(mode.defaultEditor.getMessageContent(), content);
+  });
+}
+
+test("InteractiveMode handles Ctrl+Q followup during streaming and idle", async () => {
+  const { bridge, calls } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+
+  // 1. 空闲态下触发 handleFollowUp：等同于普通 Prompt 提交
+  mode.defaultEditor.setText("Run this now");
+  await mode.handleFollowUp();
+  assert.equal(mode.defaultEditor.getText(), "");
+  assert.equal(calls.at(-1)?.method, "prompt");
+  assert.equal(calls.at(-1)?.params?.text, "Run this now");
+  assert.equal(mode.pendingFollowupList.length, 0);
+
+  // 2. 运行态下触发 handleFollowUp：进入待发队列并调用 bridge.followUp
+  mode.isStreaming = true;
+  mode.defaultEditor.setText("Run this next");
+  await mode.handleFollowUp();
+  assert.equal(mode.defaultEditor.getText(), "");
+  assert.equal(calls.at(-1)?.method, "followup");
+  assert.equal(calls.at(-1)?.params?.message, "Run this next");
+  assert.deepEqual(mode.pendingFollowupList, ["Run this next"]);
+
+  const rendered = mode.ui.render(80).join("\n");
+  assert.ok(rendered.includes("Follow-up: Run this next"));
+  assert.ok(rendered.includes("Alt+Q to edit all queued messages"));
+});
+
+test("InteractiveMode restores all queued messages on restoreQueuedMessagesToEditor and calls clearQueue", async () => {
+  const { bridge, calls } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+
+  mode.pendingSteeringList.push("steer message 1");
+  mode.pendingFollowupList.push("follow-up message 2");
+  mode.updatePendingMessagesDisplay();
+
+  const renderedBefore = mode.ui.render(80).join("\n");
+  assert.ok(renderedBefore.includes("Steering: steer message 1"));
+  assert.ok(renderedBefore.includes("Follow-up: follow-up message 2"));
+
+  await mode.restoreQueuedMessagesToEditor();
+
+  assert.equal(mode.defaultEditor.getText(), "steer message 1\n\nfollow-up message 2");
+  assert.equal(mode.pendingSteeringList.length, 0);
+  assert.equal(mode.pendingFollowupList.length, 0);
+  assert.ok(calls.some((c) => c.method === "clear_queue"));
+
+  const renderedAfter = mode.ui.render(80).join("\n");
+  assert.ok(!renderedAfter.includes("Steering: steer message 1"));
+  assert.ok(!renderedAfter.includes("Follow-up: follow-up message 2"));
+});
+
+test("InteractiveMode restores queued messages on Escape when streaming", async () => {
+  const { bridge, calls } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+  await mode.init();
+
+  mode.isStreaming = true;
+  mode.pendingSteeringList.push("interrupted steering");
+  mode.updatePendingMessagesDisplay();
+
+  // 模拟按下 escape 键中断
+  mode.ui.handleTerminalInput("\x1b"); // escape
+
+  assert.equal(mode.isStreaming, false);
+  assert.equal(mode.defaultEditor.getText(), "interrupted steering");
+  assert.equal(mode.pendingSteeringList.length, 0);
+  assert.ok(calls.some((c) => c.method === "abort"));
+  assert.ok(calls.some((c) => c.method === "clear_queue"));
+});
+
+test("InteractiveMode removes incomplete streaming assistant message on Escape interrupt and cancelled events", async () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+  await mode.init();
+
+  // 1. 模拟模型开始流式吐出半截文本 "Windows"
+  mode.handleAgentEvent({
+    type: "agent_start",
+  });
+  mode.handleAgentEvent({
+    type: "message_start",
+    message: { role: "assistant", content: "" },
+  });
+  mode.handleAgentEvent({
+    type: "message_update",
+    message: { role: "assistant", content: "Windows" },
+  });
+
+  const renderedDuringStream = mode.ui.render(80).join("\n");
+  assert.ok(renderedDuringStream.includes("Windows"));
+
+  // 2. 用户此时按下 Escape 键中断
+  mode.ui.handleTerminalInput("\x1b");
+
+  // 3. 后端发回 message_end (stop_reason="cancelled") 和 agent_end (stop_reason="cancelled")
+  mode.handleAgentEvent({
+    type: "message_end",
+    message: { role: "assistant", content: "Windows", metadata: { stop_reason: "cancelled" } },
+  });
+  mode.handleAgentEvent({
+    type: "agent_end",
+    iterations: 1,
+    stop_reason: "cancelled",
+    final_text: "",
+  });
+
+  // 4. 验证断言：半截文本 "Windows" 已从主聊天容器中彻底移除，仅呈现干净的中断提示
+  const renderedAfterInterrupt = mode.ui.render(80).join("\n");
+  assert.ok(!renderedAfterInterrupt.includes("Windows"), "Incomplete assistant fragment 'Windows' must be removed");
+  assert.ok(renderedAfterInterrupt.includes("执行已中断。"), "Interruption notice must be rendered");
+  assert.equal(mode.isStreaming, false);
+});
+
+test("InteractiveMode handles handshake model error without throwing TypeError and stops busy spinner", async () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+  await mode.init();
+
+  mode.handleAgentEvent({ type: "agent_start" });
+  mode.handleAgentEvent({ type: "turn_start", iteration: 1 });
+  mode.handleAgentEvent({
+    type: "message_start",
+    message: { role: "assistant", content: [] },
+  });
+
+  // Handshake failure (401), content with stopReason: error
+  mode.handleAgentEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: "Error code: 401 - Authentication Fails",
+      stopReason: "error",
+      metadata: { stop_reason: "error" },
+    },
+  });
+
+  mode.handleAgentEvent({
+    type: "turn_end",
+  });
+
+  mode.handleAgentEvent({
+    type: "agent_end",
+    stopReason: "error",
+    stop_reason: "error",
+  });
+
+  assert.equal(mode.isStreaming, false);
+  assert.equal(mode.isWorking, false);
+  const rendered = mode.ui.render(80).join("\n");
+  assert.ok(rendered.includes("401"), "Error message 401 must be rendered");
+});
+
+test("InteractiveMode handles auto_retry_start and auto_retry_end lifecycle", async () => {
+  const { bridge } = createMockBridge();
+  const mode = new InteractiveMode(bridge);
+  await mode.init();
+
+  mode.handleAgentEvent({
+    type: "auto_retry_start",
+    attempt: 1,
+    maxAttempts: 3,
+    delayMs: 2000,
+    errorMessage: "503 Service Unavailable",
+  });
+
+  const renderedRetry = mode.ui.render(80).join("\n");
+  assert.ok(renderedRetry.includes("重试中 (1/3)"), "Retry status indicator must be rendered");
+  assert.ok(renderedRetry.includes("503 Service Unavailable"));
+
+  mode.handleAgentEvent({
+    type: "auto_retry_end",
+    success: true,
+    attempt: 1,
+  });
+
+  const renderedSuccess = mode.ui.render(80).join("\n");
+  assert.ok(!renderedSuccess.includes("重试中 (1/3)"), "Retry status indicator cleared on recovery");
+});
+
+
+

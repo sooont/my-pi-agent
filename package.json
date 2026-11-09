@@ -1,0 +1,45 @@
+{
+  "name": "my-pi-agent",
+  "version": "0.2.0",
+  "description": "Minimalist Pi-style coding-agent framework and CLI with Pi-TUI",
+  "type": "module",
+  "bin": {
+    "my-pi-agent": "my-pi-tui/bin/my-agent.js",
+    "my-agent": "my-pi-tui/bin/my-agent.js"
+  },
+  "workspaces": [
+    "my-pi-tui"
+  ],
+  "scripts": {
+    "start": "node my-pi-tui/bin/my-agent.js",
+    "build": "npm run build --prefix my-pi-tui",
+    "test": "npm test --prefix my-pi-tui",
+    "prepack": "npm run build --prefix my-pi-tui"
+  },
+  "files": [
+    "my-pi-tui/dist",
+    "my-pi-tui/bin",
+    "my-pi-tui/package.json",
+    "src/**/*.py",
+    "pyproject.toml",
+    "README.md"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "coding-agent",
+    "tui",
+    "terminal",
+    "pi",
+    "tau"
+  ],
+  "dependencies": {
+    "@earendil-works/pi-tui": "^0.85.1",
+    "chalk": "^5.4.1",
+    "marked": "^15.0.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2"
+  }
+}

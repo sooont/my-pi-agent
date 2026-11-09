@@ -1,0 +1,1096 @@
+# 项目进度记录
+
+学习项目：从零搭一个最小 agent 框架（参考 pi / pig-mono）。**透明度优先于通用性，不奔生产。**
+本文件记录每个阶段做了什么、改了哪些文件、验证方式，方便复盘。
+
+## 当前结构（2026-09）
+
+```text
+my-pi-agent/
+├── pyproject.toml                  # ⭐ 全局统一的 Python 构建与依赖配置 (uv)
+├── uv.lock                         # 全局唯一的 Python 依赖锁定文件
+├── .venv/                          # 全局唯一的 Python 虚拟环境
+│
+├── src/                            # ⭐ 统合的 Python 业务源码 (完全对标 Tau)
+│   ├── my_agent_llm/               # 1. 统一 LLM 直连层 (Antigravity/DeepSeek/OpenAI/Stream)
+│   │   ├── client.py               # 统一 LLM 门面 (chat/stream/achat/achat_stream)
+│   │   ├── config.py               # Config 配置模型 (pydantic frozen)
+│   │   ├── models.py               # Message / Response / StreamChunk
+│   │   └── providers/              # Antigravity (Google OAuth) / DeepSeek / OpenAI
+│   │
+│   ├── my_agent_core/              # 2. 框架微内核层 (ReAct/会话树/压缩/任务系统)
+│   │   ├── agent.py                # Agent 纯异步 Harness 外壳
+│   │   ├── loop.py                 # run_agent_loop 纯函数无状态微内核与七阶段流水线
+│   │   ├── tool_history.py         # 对话转录本三阶段自愈引擎 (API 400 免疫)
+│   │   ├── message_queue.py        # MessageQueue 动态干预队列 (Steer & Follow-up)
+│   │   ├── task_store.py           # TaskStore 任务状态机与 DAG 依赖图
+│   │   ├── background.py           # BackgroundRunner 进程树清理引擎
+│   │   ├── session/                # 树状分支持久化会话系统
+│   │   ├── context.py              # 离散 Epoch 块级压缩管线 (80% 水位线门控 + 工具输出持久化到磁盘 + compact 结构化摘要)
+│   │   └── skills.py               # Skills 声明式管理与提示词注入
+│   │
+│   └── my_coding_agent/            # 3. 业务工具与 stdio RPC 服务端 (纯无头架构)
+│       ├── agent.py                # CodingAgent 门面 (Dual API: run & run_stream)
+│       ├── tools/                  # 7 大编码工具 (read/write/edit/bash/grep/find/ls)
+│       ├── mutation_queue.py       # FileMutationQueue 细粒度单文件并发互斥锁
+│       ├── permissions.py          # PermissionGate 业务权限审查门禁 (Accept-on-Diff)
+│       ├── mcp.py                  # Turnkey MCP 客户端自动加载与回收
+│       ├── file_reference.py       # @ 文件引用解析与快照直通注入
+│       └── rpc_server.py           # stdio JSON-RPC 2.0 服务端门面
+│
+├── tests/                          # ⭐ 全局统一测试目录 (uv run pytest 跑完全部)
+│   ├── llm/                        # LLM 层单元测试 (76 tests)
+│   ├── core/                       # 框架内核单元测试 (337 tests)
+│   └── coding/                     # 业务与工具测试 (252 tests)
+│
+├── my-pi-tui/                     # ⭐ 独立的终端交互表现层 (基于 @earendil-works/pi-tui)
+│   ├── package.json                # 依赖 @earendil-works/pi-tui, chalk, marked
+│   ├── tsconfig.json
+│   ├── bin/
+│   │   └── my-agent.js             # CLI 启动命令入口
+│   ├── src/
+│   │   ├── app.ts                  # TuiMainScreen 状态机与组件树组装
+│   │   ├── client.ts               # PythonKernelClient (管理 uv run python 子进程)
+│   │   ├── components/             # Pi 原厂 UI 组件 (CustomEditor, status-indicator, footer...)
+│   │   └── theme/                  # Pi 原厂 24-bit TrueColor dark.json 调色盘
+│   └── test/                       # 前端 58 个自动化与端到端测试用例
+│
+├── docs/                           # 统一设计文档中心
+├── package.json                    # 根目录 npm 工作区配置与一键启动脚本
+├── REFERENCES.md                   # 架构设计参考溯源与工程复盘
+└── README.md                       # 快速开始与全景总览
+```
+
+---
+
+## 已完成阶段
+
+### 阶段 1：工具层 pydantic 化（2026-08-03）
+
+**目标**：手写 `TYPE_MAP`（只支持 int/float/str/bool 四种标量）→ pydantic 动态建模。
+
+- 提交：`f14f330` `19f40ba` `6666f0c` `964236e` `8638a33`
+- **改了什么**：
+  - 删除 `TYPE_MAP`；`@tool` 改用 `pydantic.create_model` 从函数签名动态建模
+  - `Tool` 新增 `model` 字段——schema 生成与参数校验共用同一个 pydantic 模型
+  - `call_tool` 执行前用 `model_validate` 校验 + 类型强转（`"37"` → 37）
+  - 参数类型支持 pydantic 全集（list/dict/Optional/嵌套/默认值）
+  - 新增 `tests/test_tools.py`（tests/ 首个文件）
+- **过程中的关键教训**：规格假设「pydantic v2 默认严格区分 bool/int」被实测证伪（lax 模式接受 bool→int），补了 `BeforeValidator` 守卫。
+- **验证**：21 个离线测试全绿，demo 真实运行通过（703 / 时间 / 天气）。
+
+### 阶段 2：删 bool 守卫（2026-08-03）
+
+**目标**：用户决定宽松——不拦 bool→int 强转，换更少代码。
+
+- 提交：`3b83cd1` `bf6c263`
+- **改了什么**：删 `_reject_bool_*` / `_NUMERIC_GUARDS`；`true` 传给 int 参数被强转成 1。
+- **验证**：测试 21 → 20（删 `bool_not_accepted_as_int`）。
+
+### 阶段 3：工具层类化重构（2026-08-03）
+
+**目标**：`dataclass Tool + 自由函数` → `Tool 类 + ToolResult + ToolRegistry`（对齐 pig-mono 旧版形态）。
+
+- 提交：`926d88c` `d7b8c57` `3c26139` `57ad571`
+- **改了什么**：
+  - `Tool` 改为类：`to_openai_schema()` / `execute()` / `__call__`，支持 `name`/`description`/`params_model` 覆盖
+  - 新增 `ToolResult`（ok/data/error + serialize，永不抛）
+  - 新增 `registry.py`：`ToolRegistry`（register/unregister/get/get_schemas/execute(tool_call)）
+  - `agent.py` 改用 registry；删除 `schemas_for` / `call_tool` 自由函数
+  - `tool()` 改为工厂装饰器（支持 `@tool` 与 `@tool(name=...)`）
+- **过程中的关键教训**：最终评审抓到一个真实回归——Task 2 删 `call_tool` 时 `agent.py` 签名的 `list[Tool]` 注解悬空引用，`get_type_hints` 会 NameError（补回 import 修复）。
+- **验证**：29 个离线测试全绿（test_tools 18 + test_registry 11）。
+
+### 阶段 4：删翻译函数（2026-08-03）
+
+**目标**：用户决定去掉 `_clean_schema` / `_format_validation_error` 两个翻译层，schema 与错误消息直接用 pydantic 原始输出。
+
+- 提交：`6df40fc`
+- **改了什么**：`to_openai_schema()` 直接返回 pydantic 原始 schema（带 title）；`execute` 校验失败直接 `str(exc)`。
+- **验证**：测试相应调整后全绿（schema 断言改逐字段、错误断言匹配 pydantic 原文）。
+
+### 阶段 5：目录重组（2026-08-03）
+
+**目标**：`my_agent_core/` 移入 `packages/my-agent-core`（src 布局，独立 uv 项目），对齐 pig-mono 的 monorepo 结构。
+
+- 提交：`603380f` `0e8bb4b`
+- **改了什么**：
+  - 包移入 `packages/my-agent-core/`，src 布局 + hatchling 构建
+  - pyproject name 改为 `my-agent-core`
+  - **过程中解决的坑**：加 `[build-system]` 后 `dependencies` 一度被 Edit 错放进 `[tool.hatch.build.targets.wheel]` 段导致依赖装不上（修正归位）
+  - `.gitignore` 加入 `CLAUDE.md`（本地私有文档，不上传远程 GitHub）
+- **验证**：29 个测试全绿，demo 运行链通（429 配额限制除外）。
+
+### 阶段 6：模型边界层 `my-agent-llm`（2026-08-03）
+
+**目标**：独立「模型边界层」包——统一 `LLM` 类屏蔽 provider 差异，三 provider（openai/deepseek/anthropic）。
+
+- 提交：`2e8d53c` `d41b272` `2b1d4ef` `5b5ae4b` `dfe3ef0` `822517a` `3ca1356`
+- **改了什么**：
+  - `LLM` 门面：`chat`/`stream`/`achat`/`achat_stream` + 按 provider 路由 + kwargs 透传（只透传不碰 SDK）
+  - `Config`（pydantic frozen）；`Message`/`Response`/`StreamChunk` 数据模型（tool_calls 统一 OpenAI 形状）
+  - `OpenAIProvider`（基准翻译）→ `DeepSeekProvider`（继承 + reasoning_content 提取）→ `AnthropicProvider`（block 双向翻译 + web_search 增强）
+  - 假 SDK 注入测试缝隙（`client=` 参数），全部离线测试
+- **过程中的关键教训**：
+  - 最终评审抓到 **Critical：`achat_stream` 异步生成器契约**——基类声明协程语义、provider 实现异步生成器，内部矛盾（裁定统一为异步生成器）
+  - 修复波次又引入 **回归：`LLM.chat` 注入 `max_tokens=None` 废掉 anthropic 4096 回落**（复审抓到，第二轮修复为源头不注入）
+- **验证**：33 个离线测试全绿，无 warning。
+
+### 阶段 6.1：流式 tool_calls 聚合修复 + 注册表拆分（2026-08-06，未提交）
+
+**目标**：修复「openai/deepseek 流式不聚合 tool_calls」的文档违约；顺带拆出 provider 注册表、补基类构造契约。
+
+- **改了什么**：
+  - `providers/registry.py`（新增）：`PROVIDER_REGISTRY` 注册表从 `client.py` 拆出（跨模块引用，去下划线正名）
+  - `_base.py`：补抽象 `__init__(self, config: Config)` 构造契约；`achat_stream` 抽象标记 `yield` 改 `yield StreamChunk(content="")`（修 pyright 返回类型）
+  - `openai.py`：新增模块级 `_ToolCallAccumulator`（按 index 聚合增量 tool_calls 片段）；`stream`/`achat_stream` 聚合 tool_calls + 捕获 usage，结束补发末块
+  - `deepseek.py`：复用 `_ToolCallAccumulator`，流式聚合 tool_calls + usage + reasoning；四个覆盖方法参数注解补齐（与 openai 基准一致）
+  - 新增 3 个流式聚合测试（openai 同步 / openai 异步 / deepseek 带 reasoning），先红后绿
+- **过程中的关键教训**：
+  - 原注释「v1 简化：末块由调用方汇总」**无文档背书**——spec §7.2 与计划 docstring 都要求「末块带完整 tool_calls + usage」，是实现时静默偏离
+  - OpenAI 兼容流式把 tool_call 分片送达（id/name 只出现一次、arguments 是碎片 JSON），必须按 index 键控拼接
+  - pig-mono 内部流式**不一致**：openai 用 tool-aware 完整版，deepseek/azure/groq 用 `iter_openai_stream_choices` 简版（只有文本、`break` 在 finish_reason、吃不到 usage）。我们两端对齐到完整版，deepseek 比 pig-mono 的还完整
+- **验证**：my-agent-llm 33→36 测试全绿；my-agent-core 34 测试不受影响。
+
+### 阶段 7：agent 层接入 `my-agent-llm`（已完成）
+
+**目标**：`run_agent` 从裸 `openai.OpenAI` 改为用统一 `LLM` 类 + `Message`。
+
+- 提交：`6035bdc` `f9138cd` `本次提交`
+- **改了什么**：
+  - `run_agent` 签名 `client+model` → `llm` 对象；messages 从 wire dict → `list[Message]`
+  - `ToolRegistry.execute` 收协议 dict（`tool_call["function"]["name"]`），agent 直接喂 `Response.tool_calls`
+  - `main.py` `build_client()` → `build_llm()`（`.env` 映射到 `Config`）
+  - 新增 `tests/test_agent.py`（假 LLM 离线测循环）
+- **过程中的关键教训**：`Response.tool_calls` 是协议 dict 而非 SDK 对象——registry 接口从「属性对象」改为「dict」以对齐，避免 agent 里造中间形状。
+- **验证**：`uv run python -m pytest -q` 全绿（34 个）；demo 链路通到真实 API 但被 401 拦下（`.env` key 失效/过期），最终答案未验证。
+
+### 阶段 8：单层 Agent 类 + 事件（2026-08-06）
+
+**目标**：`run_agent` 函数 → pig-mono 式单层 `Agent` 类（状态 + 循环 + 工具执行），适配 my-agent-llm。
+
+- 提交：`30bbf51` `58bacf9` `ee13328` `229096d` `ef94c74` `e1b9629`（worktree 分支 `worktree-phase2-single-agent`）
+- **改了什么**：
+  - `agent.py`：`run_agent` → `Agent` 类（`run`/`reset`/`_prepare_tool`/`_execute_tool`）；`loop.py`/`llm.py` 不存在（单层）
+  - `events.py`（新增）：8 个事件 dataclass，`AssistantMessageAdded.message` 为 `Message` 对象
+  - 中间件：`_prepare_tool`（解析 + `before_tool` 拦截/改写）+ `_execute_tool(tc, args)`（执行 + `after_tool`），拦截用 `raise ToolBlocked`
+  - `main.py` demo 改用 `Agent` + `on_event` 打印循环过程
+  - `__init__.py` 导出公共 API（`Agent`/`tool`/`Tool`/`ToolResult`/`ToolRegistry`/`ToolBlocked`/事件）
+  - 测试：`test_agent.py` 迁移 + 扩充（5→13），新增 `test_events.py`（10）
+- **过程中的关键教训**：
+  - 单层形态下循环无法脱离 Agent 独立测试，测试缝隙靠注入鸭子类型 `FakeLLM`（`Agent(llm=FakeLLM(...))`）保住；`LLM.chat` 本身就是缝隙，不需要抽象 `llm_call` 函数
+  - 工具执行复用 `ToolRegistry.execute` 外包中间件，不手写六段管道；`before_tool` 改写 args 需重序列化回协议 dict（`registry.execute` 内部会重解析）
+  - **ToolCallStart 时序回归**：把 `_execute_tool` 设计成「一把梭执行完才返回 args」导致 start 事件在工具执行后发射——评审抓出，拆 `_prepare_tool` + `_execute_tool` 两阶段修复
+  - `run()` 裸 `json.loads` 打穿「永不抛」——畸形 JSON 参数会让循环崩溃，解析收敛进 `_prepare_tool` 由守卫兜住
+- **验证**：`uv run python -m pytest -q` 全绿（53 个：17+12+8+10，agent 8→13）；demo 真跑三题通过（703 / 时间 / 双城天气）。
+
+### 阶段 8.1：事件集对齐 pi 生命周期（2026-08-06）
+
+**目标**：事件集 8→10，对齐 pi 的生命周期模型（Agent/Turn/Message/Tool 四组成对）。
+
+- 提交：`4f1ead8` `9fa879b`（worktree 分支 `worktree-event-lifecycle`）
+- **改了什么**：
+  - `events.py`：删 `AssistantMessageAdded`；加 `TurnEnd`/`MessageStart`/`MessageUpdate`/`MessageEnd`/`ToolExecutionUpdate`；`ToolCallStart`/`ToolCallEnd` 改名 `ToolExecutionStart`/`ToolExecutionEnd`；`AgentEnd` 加 `messages`（4 字段，messages 在前）
+  - `agent.py`：`run()` 按 pi 时序发射——`MessageStart/End` 对 user/assistant/tool 都发，`ToolExecution*` 代替 `ToolCall*`，`TurnEnd(message, tool_results)` 每轮结束发，`AgentEnd` 带 messages 副本
+  - `main.py`/`__init__.py`：demo 打印 + 公共 API 同步新事件（含 `emit` 导出）
+- **过程中的关键教训**：`MessageUpdate`/`ToolExecutionUpdate` 为异步流式预留（同步不发射）；`MessageStart/End` 对每条进 transcript 的消息都发（pi 语义，非仅 assistant）；中间态下 `__init__.py` 引用旧事件会让全量 pytest 收集失败——重命名事件时消费点（`__init__`/`main.py`）须同 commit 同步
+- **验证**：`uv run python -m pytest -q` 全绿（58 个：17+12+14+15）；demo 真跑三题通过（print_events 用新事件名）。
+
+### 阶段 8.2：hook 统一（事件+中间件 → hook 注册表，2026-08-06）
+
+**目标**：扩展机制从「事件观察（on_event）+ 中间件干预（before_tool/after_tool/ToolBlocked）」统一为「hook 注册表」（仿 CC）。
+
+- 提交：`adbb49c` `5a7cb37` `21b9c50` `e3ba480`（worktree 分支 `worktree-hook-unification`）
+- **改了什么**：
+  - `events.py`：加 `HookResult`（block/reason/updated_args/updated_result）+ `Interceptable` 标记；`ToolExecutionStart/End` 继承 `Interceptable`（可被 hook 干预）
+  - `agent.py`：删 `on_event`/`before_tool`/`after_tool` 参数；加 `_hooks` 注册表 + `register_hook`/`unregister_hook`/`_emit`；`_prepare_tool`/`_execute_tool` 用 HookResult（拦截/改参数/改结果）
+  - `tools.py`：删 `ToolBlocked`
+  - `main.py`/`__init__.py`：demo 用 `register_hook`；公共 API 加 `HookResult`/`Interceptable`
+- **过程中的关键教训**：
+  - hook 回调返回 None = 纯观察、返回 HookResult = 干预；同一事件可挂多个 hook、非 None 短路
+  - `ToolExecutionStart/End` 触发点移入 `_prepare_tool`/`_execute_tool`（干预结果要在工具执行前/后拿到）
+  - **hook 异常语义分裂**：工具路径 hook 异常转错误字符串（保住「tool_calls 必配对」不变式），观察路径 hook 异常向上抛（视为使用方 bug）——设计文档 §4.2/§8 原先自相矛盾，本次消解
+- **验证**：`uv run python -m pytest -q` 全绿（63 个：17+12+14+20）；demo 真跑三题通过（multiply=703 / 时间 / 双城天气）。
+
+### 阶段 3：session 管理（2026-08-10）
+
+**目标**：会话持久化——树结构 + rewind + fork + 跨进程续聊 + 多会话仓库 + workspace 隔离（pig-mono/pi 式）。
+
+- 提交：`dc6a0a8` `28625a0` `8ae1f25` `abdc90b` `04ba33e` `2684ab3` `c5527e4` `adfa02b` `a51978d` `ee8dca3`（worktree 分支 `session-management` → `session-fork` → `session-store-rename` → `session-no-version` → `session-workspace`）
+- **改了什么**：
+  - `session.py`（新增）：`SessionEntry`（pydantic，id/parent_id/timestamp/role/content/metadata）+ `SessionTree`（entries + current_id 指针；add_entry / get_current_path / get_path_to_entry / rewind）+ `Session`（add_message 逐条原子全量重写 / load / get_current_path_messages / rewind / reset）
+  - `session_store.py`（新增，原名 store.py）：`SessionStore` —— create / list（倒序）/ open（前缀匹配 + 歧义报错）/ delete / fork；id = 时间戳-hex，碰撞重试
+  - `agent.py`：`session=` 参数（有则 run() 内逐条落盘、构造/续跑时恢复上下文；无则纯内存向后兼容）；`reset()` 同步清树重写文件
+  - 文件格式：header 行（id/created_at/cwd/current_id/root_id）+ entry 行 JSONL；`type/version` 已删
+  - workspace 隔离：会话目录 = `<workspace>/.my_agent_core/sessions`（pig-mono 式），跨项目天然隔离
+  - `__init__.py`/README：导出 Session/SessionTree/SessionStore；阶段 3 勾选
+- **过程中的关键教训**：
+  - 树 + 指针：rewind = 改 `current_id` 一个变量，旧分支留档可无限切回；上下文 = 沿 parent 回溯的路径；只存 parent_id 是回溯路径的最小实现（down 遍历用 entries 全量扫描）
+  - 原子写：临时文件 + fsync + os.replace——任何时刻崩溃文件都是完整快照；每次 add_message 全量重写换崩溃安全
+  - fork 在仓库层（路径生成是 Store 的职责，与 create 一致）；pig-mono 的 fork 在 Session 层是因它的 Session 自己管路径
+  - **plan bug**：测试用 `s1.id[:12]` 前缀在同秒 create 时确定性歧义（id 前 15 字符是时间戳），改 `[:20]` 修复（reviewer 确认无更优替代）
+  - **final review 抓到 F1**：同 Agent rewind 后续跑内存 messages 不重同步 → LLM 收到含废弃分支尾的矛盾上下文；修 `run()` 开头同步到 session 当前指针（非 rewind 情形幂等）
+  - **final review 误判驳回 F2**：声称 max_iterations 耗尽时文件有孤儿 assistant(tool_calls)——核实 for 循环在 while 体内必然执行、tool 消息必然落盘，配对完整
+  - type/version 是冗余标签：防误读的硬防线是目录隔离（glob *.jsonl）+ 必要字段校验（load 要求 id/created_at 存在）
+  - workspace 隔离（pig-mono 式）：root 为绝对路径时直接用（测试兼容），相对时解析为 workspace/root
+- **验证**：`uv run python -m pytest -q` 全绿（86 个：原 63 + session/store 23）。
+
+### 阶段 4：context 管理（2026-08-11）
+
+**目标**：超 budget 上下文自动压缩——压缩管线（工具输出落盘持久化 + compact 结构化摘要）+ usage 锚定估算 + retainedTail 缓存，Agent 集成压缩策略、事件通知与会话内缓存持久化。
+
+- 提交：`4b5925f` `168168b` `e74a610` `014b0ba` `575da36`（worktree 分支 `context-management`）
+- **改了什么**：
+  - `session.py`：`SessionEntry` 加 `type` 字段；新增 `add_summary_cache` / `get_full_history_messages`；`rewind` 加护栏
+  - `context.py`（新增）：`ContextManager` 压缩管线（工具输出落盘持久化 + compact 结构化摘要）+ usage 锚定 + retainedTail 缓存（prepare / 缓存复用 / 迭代再摘要 / 摘要失败降级不压缩）
+  - `agent.py`：`context_budget=` 参数、`run()` 内 prepare、`compact()` 手动触发、`ContextCompacted` 事件发射
+  - `__init__.py` / README：导出 `ContextManager`；阶段 4 勾选
+- **过程中的关键教训**：
+  - 摘要消息必须 user 角色且 persona 保留（设计文档 §2.2，fix round 1）
+  - snip off-by-one（占位符计数）
+  - force_compact 需强制 cut（"无条件摘要"）
+- **验证**：`uv run python -m pytest -q` 全绿（108 个：原 86 + context/agent 22）；`from my_agent_core import ContextManager` 导入通过。
+
+### 阶段 5：skill 机制（2026-08-13）
+
+**目标**：框架层支持 skill——声明式 `.md` 文件（frontmatter + 正文），发现 / 清单格式化 / 显式调用。
+
+- 提交：`66eab8d` `6d7a8e7` `0728b1a` `d0c6785` `ad5030d` `fc47f63` `e367523`（+ docs `ef00e91` `2c7edca`）
+- **改了什么**：
+  - `skills.py`（新增）：`Skill` 数据模型 + `parse_frontmatter`（PyYAML，坏 YAML 静默降级）+ 发现（pig-mono 式一层子目录 + `name=目录名` + 缺 description 跳过）+ 清单 XML 格式化 + `format_invocation` 显式调用包装
+  - `Agent` 集成：`skill_dirs` 三态（None→探测 `.agents/skills` / []→禁用 / 非空→目录）+ system 清单块 + `invoke_skill(name)` 显式调用
+  - 收尾 `e367523`：skill 机制改为 Repository 类管理（`SkillManager` 收编发现/查询/格式化，对标 pig-mono）
+- **关键教训**：模型侧无 read 工具 → skill 正文只能由宿主 `invoke_skill` 显式注入（不预置 read_skill）；`SKILL.md` 兼容 UTF-8 BOM（utf-8-sig 读取，零副作用）。
+- **验证**：全量测试全绿。
+
+### subagent 机制（2026-08-15/16，另列）
+
+**目标**：声明式子代理——`agents/*.md` + frontmatter 定义，宿主/模型经 `task` 工具委派。
+
+- 提交：`ffb583d` `e4fc6d0` `f10c900` `2b7f08d` `3a04913` `0494be3`
+- **改了什么**：
+  - `subagents.py`（新增）：`Subagent` 数据模型 + `SubagentManager`（发现 agents/*.md，frontmatter camelCase→snake_case 映射）+ 清单格式化 + `DEFAULT_SUBAGENT`
+  - `Agent` 集成：`subagent_dirs` 三态 + system 清单块 + `model`/`effort` 参数透传（子代理换模型前置）
+  - 内置 `task` 工具（`make_task_tool`）：spawn 子 Agent、fresh context、只回最终文本、工具过滤 + 防递归
+- **关键教训**：防递归靠「子代理 `subagent_dirs=[]` 不装配 task 工具」一刀切；effort 降级为 deferred（OpenAI SDK 用 reasoning_effort、Anthropic 用 thinking，无统一 `effort` kwarg）。
+- **验证**：149 个测试全绿。
+
+### Task 委派系统 + builtin 包化（2026-08-16）
+
+**目标**：委派从「一个函数」升级为 Task/TaskStatus/TaskManager 生命周期（对标 OpenHands）；tools.py 升级为 tools/ 包。
+
+- 提交：`289d52a` `28f5c4a` `6be1858`
+- **改了什么**：
+  - `tasks.py`（新增）：`Task`（result/error）+ `TaskStatus`（RUNNING/COMPLETED/FAILED 三态）+ `TaskManager`（start_task → 生命周期）
+  - `make_task_tool` 工具桥化（调 TaskManager → 转字符串）
+  - `tools.py` → `tools/` 包 + `tools/builtin.py` 收内置工具工厂
+- **验证**：154 个测试全绿。
+
+### 四个文件工具（2026-08-16）
+
+**目标**：框架层 builtin 补 pi 的四个基本工具 read/edit/write/bash（反转「归属 coding agent 层」决策）。
+
+- 提交：`0a45b9a` `a2de9c3` `5a9608e`（+ docs `2931834`）
+- **改了什么**：
+  - `builtin.py` → `builtin/` 包（`task.py` + `files.py`）
+  - `files.py`：`_safe_path`（resolve + is_relative_to 路径逃逸）+ 四个工厂 `make_read/make_write/make_edit/make_bash_tool`（收 `root`）+ bash 危险命令黑名单 + 120s 超时
+- **关键教训**：`_safe_path` 必须 `Path(root).resolve()`（symlink/相对 root 会 false-block）；bash 超时测试跨平台（`sleep 5` 非 cmd.exe 命令，改 `python -c "import time; time.sleep(5)"`）。
+- **验证**：全量测试全绿。
+
+### 组件装配重构（2026-08-16）
+
+**目标**：Agent 结构优化——工具注册统一、hooks 统一、context 默认启用、方法重排。
+
+- 提交：`e96a9ad` `05f9991` `7ffeaa3` `6980f17` `59bb219` `abed0c6` `f1b81bf` `4bc13cf` `bd9eed4`
+- **改了什么**：
+  - `_register_tools` 统一注册（用户工具 + 内置 task）
+  - hooks 抽成 `HookRegistry` 类（对标 ToolRegistry）+ 改为构造参数 `hooks=[(事件类, 回调)]` 批量注册（去掉 register_hook/unregister_hook 公共 API）
+  - `context` 默认启用（budget 默认值下沉 ContextManager=100k，Agent 不传用组件默认）
+  - 装配外移试过后撤回（`_init_messages`/`_init_context` 写回 agent.py 内部方法）；方法按「构造/公共 API/内部实现」三组重排
+- **验证**：全量测试全绿（纯重构无新增）。
+
+### session 统一持久化 + system 归 Agent（2026-08-16）
+
+**目标**：system 从「session 持久化内容」改为「Agent 运行时配置」，session 只存纯对话；子代理独立持久化。
+
+- 提交：`a0fbbbf` `8809e48` `4fb888f` `2ef28c7` `6eb19dd`
+- **改了什么**：
+  - `Session` 去 `system_prompt`（只存纯对话，metadata 参数塞 header）；`reset()` 清空树
+  - `Agent` 拼 system（`system_prompt` + skill 清单 + subagent 清单合成消息首条）；`session` 必填（去掉内存模式）
+  - 子代理独立 session 落盘 `subagents/`（meta 塞 header：agent_type/spawn_depth/parent_session_id），对齐 Claude Code 子代理持久化目录
+  - `run()` rewind-sync 保留 system 首条 + 同步纯对话（否则 rewind 后 system 丢失）
+- **关键教训**：system=agent 定义、session=运行历史（对齐 anthropic-sdk-python 的 `agents.create(system=...)` 与 Claude Code 子代理目录）；防污染断言曾恒真，改成真检测父 session 不含子代理 user 消息。
+- **验证**：165 个测试全绿。
+
+### 阶段 9：extension 机制（2026-08-17）
+
+**目标**：外部 `.py` 扩展加载——事件订阅 + 工具注册 + 命令（对齐 pig-mono extensions.py）。
+
+- 提交：`09b7527` `082d75a` `4ba9183` `8976097`
+- **改了什么**：
+  - `extensions.py`（新增）：`ExtensionAPI`（on 事件订阅 / tool 工具注册 / command 命令三件套）+ `ExtensionManager`（discover / load_extension / load / handle_command）
+  - 事件订阅复用 `HookRegistry`（类型化事件 + 双参 handler `(event, api)`，返回 `HookResult` 干预）；工具注册复用 `@tool`；命令查表调度（0/1 参自适应）
+  - `Agent` 接入：`extension_dirs` 三态构造参数，加载在 `_register_tools` 之后（extension 工具可覆盖内置工具）；坏扩展隔离（print 不抛）
+- **关键教训**：plan 测试 #8 笔误（命令注册在独立 ExtensionAPI 却用新 ExtensionManager 调，必抛 ValueError），implementer 修正确认；final review 抓「extension 覆盖内置工具零测试」，补覆盖测试锁住「后加载覆盖」语义。
+- **验证**：182 个测试全绿（17 个 extension 测试 + 既有 165）。
+
+### 阶段 9.2：基于 Extension 的 MCP 客户端扩展（2026-08-17）
+
+**目标**：基于 `ExtensionAPI` 机制实现 MCP 客户端扩展——Stdio 子进程长连接、同步/异步线程事件循环桥接、`Tool` 解耦与 `raw_schema` 增强、`.mcp.json` 工作区配置加载。
+
+- 提交：`950d528` `222754c` `d52764f` `300a742` `1fa10ed`
+- **改了什么**：
+  - `tools/__init__.py`：`ToolResult` 增加 `meta: dict[str, Any]`；`Tool` 增加 `raw_schema: dict | None` 与 `timeout: float | None` 参数，解耦 Python 函数注解推导，直接支持外部 JSON Schema 协议转换与字典参数执行。
+  - `mcp.py`（新增）：`MCPServerConfig`（配置模型）+ `MCPConnection`（后台线程 asyncio 事件循环长连接守护，跨线程阻塞 RPC 转发 `session.call_tool` 与超时防护）+ `MCPClientManager`（`.mcp.json` 读取解析、多 Server 批处理连接、`atexit` 优雅关闭）。
+  - `__init__.py`：导出 `MCPClientManager`、`MCPConnection`、`MCPServerConfig`。
+  - 测试：新增 `tests/test_mcp.py`（配置解析 + Stdio 握手与工具调用）与 `tests/test_mcp_extension_e2e.py`（端到端 FakeLLM 驱动 Agent ReAct 循环调 MCP 工具）。
+- **过程中的关键教训**：
+  - 同步/异步桥接：官方 `mcp` SDK 是基于 `asyncio` 的长连接上下文管理器，通过为每个 Server 维护一个后台守护线程与 `asyncio.run_coroutine_threadsafe(...).result(timeout=...)` 实现了干净、高效的同步跨线程调用。
+  - 100% 离线测试：使用内联 Python 脚本作为 Stdio MCP Server 子进程，完全不依赖外部网络与外部 CLI 安装。
+- **验证**：全量 223 个测试全绿（187 个 core 测试 + 36 个 llm 测试）。
+
+### 阶段 10：框架层原生异步架构升级（2026-08-18）
+
+**目标**：将 `my-agent-core` 从同步伪装全面重构为原生 `asyncio` 异步引擎，实现流式 Token 增量事件打字机、无污染 `agent.abort()` 熔断取消机制、声明式 `is_parallel_safe` 读写分流并发与严格保序回填、MCP 客户端彻底去多线程化（`AsyncExitStack`）。
+
+- 提交：`c0fa31c` `422e4a1` `10e3bd4` `c1d41f3` `43c801e` `a5a3e87` `eef8a36` `9bb5018` `0dba2fc` `0cadeb1` `e006c7f` `8d0159b`
+- **改了什么**：
+  - `events.py`：`HookRegistry.emit(event)` 异步化（支持 `async def` 协程与同步 `def` 回调混合注册与短路拦截）；`MessageUpdate` 继承 `Interceptable` 并增加 `chunk` 字段，支持流式 Token 生成过程中的 Hook 实时熔断。
+  - `tools/core.py` & `registry.py`：`Tool` 增加 `is_parallel_safe: bool = False`；`Tool.execute` 支持原生协程并用 `asyncio.to_thread` 自动桥接同步函数；`ToolRegistry.execute_batch` 实现**只读并发（`asyncio.gather`）+ 写入按序串行 + 严格保序回填**。
+  - `context.py`：`prepare`、`force_compact`、`_do_summarize`、`_call_summarizer` 压缩管线异步化，使用 `await self.llm.achat` 生成 compact 结构化摘要。
+  - `agent.py`：核心 ReAct 循环重构为原生异步 `async def run(prompt)`，接入 `llm.achat_stream` 流式迭代；实现 `agent.abort()` 叫停机制（叫停时丢弃未完成半截内容，不写入 Session，发射 `AgentEnd(stop_reason="cancelled")`）；移除冗余同步入口 `run_sync`（提交 `6d20c1a`），保持纯粹原生异步 API。
+  - `tasks.py` & `task.py`：`TaskManager.start_task` 与工具桥 `task` 异步化，标记 `is_parallel_safe=True`，支持父 Agent 一次性派发多个子代理并发并行执行。
+  - `files.py` & `mcp.py`：`read` 标记为并发安全，`write/edit/bash` 标记为写入串行；MCP 客户端基于 `AsyncExitStack` 重写，彻底移除所有 `threading.Thread`、`threading.Event`、`run_coroutine_threadsafe` 等多线程代码（~60% 代码量缩减）。
+  - `main.py`：升级为 `asyncio.run(amain())`，展示流式 Token 打字机打印与工具并发调用效果。
+- **过程中的关键教训**：
+  - 优雅叫停与脏上下文隔离：Cancel 发生时必须直接丢弃未完成的累积文本，不向持久化 Session 与上下文注入残缺内容，避免模型在下一轮对话中产生“续写断句”幻觉。
+  - 并发执行与上下文严格保序：只读工具并发启动（如并发读取多个文件），写入工具串行；但最终回填给 `messages` 和 `session` 时按大模型原始 `tool_calls` 索引预分配插槽回填，确保历史记录严格确定性。
+  - MCP 原生异步：基于 `AsyncExitStack` 进入 `stdio_client` 与 `ClientSession` 上下文，彻底消除了后台守护线程与跨线程事件循环的复杂性。
+  - 接口纯粹性：砍掉容易滋生隐蔽死锁与线程池复杂性的 `run_sync` 同步桥接，全面拥抱 100% 原生异步协程。
+- **验证**：全量 231 个离线测试全部 100% 绿灯通过（195 个 core 测试 + 36 个 llm 测试）。
+
+### 阶段 11：my-coding-agent 产品层（2026-08-26）
+
+**目标**：分层纠偏——新建 `my-coding-agent` 产品层（对应 pig-mono `pig-coding-agent`），把此前误放框架层的文件工具（read/write/edit/bash）与 MCP 从 `my-agent-core` 迁出，落到产品层并完成薄装配（`build_coding_tools` + `CodingAgent`）；subagent 机制保留框架层。
+
+- 提交：`1663c63` `48d834f` `d66cb4b` `b681b8b` `d9d1134` `faa64ae`
+- **改了什么**：
+  - 新建 `packages/my-coding-agent`（src 布局）：`tools.py`（文件工具四工厂 + `_safe_path` 路径逃逸 + bash 黑名单，原样迁自 files.py）、`mcp.py`（`MCPServerConfig`/`MCPConnection`/`MCPClientManager` + `extension(api)` 入口，原样迁自 extensions/builtin/mcp.py，保持 extension 形态）、`agent.py`（`build_coding_tools(workspace)` 返 4 工具 + `CodingAgent` 薄封装，构造自动装配文件工具并委托框架 `Agent.run`）、`__init__.py`、`pyproject.toml`（依赖 my-agent-core / my-agent-llm / mcp）。
+  - 框架层瘦身：`my-agent-core` 删 `tools/builtin/files.py`（builtin 只留 `task` 委派工具）、删 `extensions/builtin/`（原 MCP 整个子包）、顶层 `__init__.py` 删 MCP 三件套导出、`pyproject.toml` 删 `mcp>=2.0.0` 依赖。
+  - mcp 版本对齐：my-coding-agent 的 mcp 约束锁 `>=2.0.0,<2.1`，与框架层此前锁的 2.0.0 一致。
+  - 测试：新增 `tests/test_tools.py`（文件工具 10，迁自 test_files）、`test_mcp.py` + `test_mcp_extension_e2e.py`（MCP 4，迁入）、`test_agent.py`（产品层装配 4）。
+- **过程中的关键教训**：
+  - 分层边界（判据「去掉业务后这能力还有没有独立意义」）：文件工具是编码专属 → 产品层；subagent 委派是通用协作机制 → 框架层。此前 2026-08-16 把文件工具反转放框架层是「夹生态」，本次归位。
+  - 依赖版本漂移：`mcp>=2.0.0` 在全新 uv 项目里意外解析到 2.1.1（框架层锁 2.0.0），导致「原样迁入」的 MCP 测试红 1 例；锁 `<2.1` 守住「移动不改逻辑」原则，而非去适配新版本行为。
+- **验证**：三包离线测试全绿，总计 **235 个测试**（my-agent-core 181 + my-agent-llm 36 + my-coding-agent 18）。
+
+### 阶段 12：Extension 五大决策点与生命周期拦截体系（2026-08-26）
+
+**目标**：对标 Pi 源码讲解第 7 章，补齐扩展系统的 5 大生命周期决策拦截点（`input / before_agent_start / context / tool_call / tool_result`），使 Extension 具备全生命周期的双向干预与安全防护能力，同时坚守「不引入 UI 概念」、「保持真实 Session 零污染」的设计原则。
+
+- 提交：`6f31e33` `b596d50` `302eac9`
+- **改了什么**：
+  - `events.py`：新增 `UserInput(Event, Interceptable)`、`BeforeModelCall(Event, Interceptable)`，升级 `AgentStart(Event, Interceptable)`（携带 `system_prompt` 与 `user_input` 字段）；`HookResult` 扩充 `updated_input`、`updated_system_prompt`、`updated_messages` 字段。
+  - `agent.py`：在 `run()` 执行流中织入三大新拦截点：
+    1. **决策点 1 (`UserInput`)**：在输入写入 Session 前触发，支持 `block=True` 拦截（不写历史）或 `updated_input` 改写输入；
+    2. **决策点 2 (`AgentStart`)**：在准备好系统消息后触发，支持 `updated_system_prompt` 动态更新首条 system 消息；
+    3. **决策点 3 (`BeforeModelCall`)**：在 `_ctx.prepare()` 产出 `view` 后、调用大模型前触发，支持 `updated_messages` 临时改写送给大模型的视图（`self.messages` 与 Session 磁盘保持绝对纯净）；
+    4. **决策点 4 (`ToolExecutionStart`)** 与 **决策点 5 (`ToolExecutionEnd`)** 继续保持对工具的入参拦截与出参改写。
+  - `extensions/core.py`：`ExtensionAPI.on` 补充 `@overload` 类型注解，保证 IDE 与类型检查器对装饰器语法的精准识别。
+  - `__init__.py`：导出 `UserInput` 与 `BeforeModelCall`。
+- **过程中的关键教训**：
+  - 临时视图隔离（No Session Pollution）：扩展在 `BeforeModelCall` 中注入的临时提醒（如 `[EPHEMERAL WARNING]`）只作用于当前的 `view` 变量，绝不能追加进 `self.messages` 或 Session JSONL 磁盘文件，保证会话历史的真实确定性。
+  - 缺省 System Prompt 兼容：当 Agent 构造时未传入 `system_prompt`（且无 skills/subagents 清单）时，`self.messages` 首条无 system 消息；当扩展返回 `updated_system_prompt` 时，自动在 `self.messages[0]` 处插入新的 system 消息。
+- **验证**：三包离线测试全绿，总计 **241 个测试**（my-agent-core 187 + my-agent-llm 36 + my-coding-agent 18）。
+
+### 阶段 7：memory 记忆系统（2026-08-26）
+
+**目标**：实现文件注入式 + 受控条目化长期记忆系统（对标 hermes-agent 精简版），让 Agent 拥有跨 Session 的持久化记忆能力。通过 `MEMORY.md`（Agent 笔记，2200 字符限制）与 `USER.md`（用户画像，1375 字符限制）双文件存储，启动时捕获 Frozen Snapshot 冻结注入 System Prompt 保证 Prefix Cache 稳定，并提供结构化的 `memory` 维护工具（`add/replace/remove`）防止模型裸写 Markdown 膨胀写乱。
+
+- 提交：`80e0d60` `8fb8910` `6bb6239` `5bfca61` `b9a54f0` `9945fb0`
+- **改了什么**：
+  - `memory.py`（新增）：
+    - `MemoryStore`：管理 `MEMORY.md` 与 `USER.md`，使用 `\n§\n` 条目切分与 `utf-8-sig`（容忍 Windows BOM）；启动时 `load_from_disk()` 捕获冻结快照 `_snapshot`；`add` 增量追加、`replace` / `remove` 唯原子串匹配定位；支持精确去重、超限拦截与提示、临时文件原子落盘（`tempfile.mkstemp` + `os.fsync` + `os.replace`）；`format_all_for_system_prompt()` 格式化为 `<MEMORY_CONTEXT>` 提示词块。
+    - `make_memory_tool(store)`：使用 `@tool` 生成受控维护工具，接收 `target: Literal["memory", "user"]` 与 `action: Literal["add", "replace", "remove"]`，内部完成严格参数校验与分发，遵循 Never-Throw Guarantee。
+  - `agent.py`：
+    - `__init__` 新增 `memory_dir: str | Path | None | Literal[False] = None`（`None` 自动探测 `<cwd>/.my_agent_core/memory`，`False` 显式禁用，`str|Path` 指定目录）；
+    - 在 `_register_tools` 前初始化 `MemoryStore` 并立即调用 `load_from_disk()` 冻结快照；
+    - 在 `_register_tools` 中自动注册 `make_memory_tool(self.memory_store)`，用户传同名工具时抛 `ValueError` 防撞名；
+    - 在 `_init_messages` 中将冻结快照拼入首条 system message；
+    - 在 `reset()` 中调用 `self.memory_store.load_from_disk()` 重载磁盘并重拼 system 消息。
+  - `__init__.py`：导出 `MemoryStore` 与 `make_memory_tool`。
+  - 测试：新增 `tests/test_memory.py`（14 个测试用例，覆盖条目切分、BOM 读取、快照冻结不变性、唯原子串匹配与歧义检测、超限防护、工具 schema 与执行、Agent 自动探测与注入、禁用与冲突保护、端到端跨 Session 持久化与召回）。
+- **过程中的关键教训**：
+  - Frozen Snapshot 不变性：会话运行中大模型调用 `memory` 工具写入新条目时，只落盘更新磁盘与 live 数据，绝不修改当前会话的 System Prompt 内存快照，以此保持 LLM 提示词前缀哈希（Prefix Cache）的高度稳定，仅在下个 Session 启动或显式 `reset()` 时重载生效。
+  - 唯原子串定位与歧义防护：在 `replace` 和 `remove` 操作中，要求 `old_text` 必须在当前 store 中唯一命中某一条目；若未命中或匹配到多条不同条目，返回清晰的匹配列表错误提示引导大模型提供更具体的文本。
+- **验证**：三包全量 255 个离线测试全部 100% 绿灯通过（my-agent-core 201 + my-agent-llm 36 + my-coding-agent 18）。
+
+### 阶段 13：Claude Code 风格 Plugin 插件系统（2026-08-26）
+
+**目标**：实现 100% 对齐 Claude Code 官方规范与 OpenHands 实践的 Plugin 插件聚合分发系统（`PluginManifest` + `Plugin` + `PluginManager`）。支持自包含插件包（`.claude-plugin/plugin.json`、`skills/`、`agents/`、`.mcp.json`、`commands/` 兼容）以及根级单 `SKILL.md` 简写插件，由 `PluginManager` 统一扫描、Manifest 容错解析与子资源解构，并自动注入框架各底层 Manager（`SkillManager`、`SubagentManager`）。
+
+- 提交：`9ad7b20` `2ceab5b` `6df9aa4` `be06008` `7995440` `ebf4a3a` `1d9a282`
+- **改了什么**：
+  - `plugins.py`（新增）：
+    - `PluginAuthor` & `PluginManifest`：解析 Claude Code 官方 `plugin.json` 元数据，支持 `author` 字符串 `"Name <email>"` 与字典格式兼容；
+    - `Plugin.from_directory()`：按顺序查找 `.claude-plugin/plugin.json` ➔ `.plugin/plugin.json` ➔ `plugin.json`；若无 manifest 或 JSON 损坏，自动以目录名推断默认 `PluginManifest(name=dir.name)`（智能兜底）；
+    - 组件目录解构：`skills_dir`（优先 `skills/`，次选 `commands/`，根目录单 `SKILL.md` 时返回插件根）、`agents_dir`（`agents/`）、`mcp_config_path`（`.mcp.json`）；
+    - `PluginManager`：支持三态目录扫描（`dirs=None` 探测 `.agents/plugins`，`dirs=[]` 禁用，`dirs=[Path]` 显式指定），识别单个插件目录或插件集合父目录，提供 `get_skill_dirs()`、`get_subagent_dirs()`、`get_mcp_config_paths()`。
+  - `skills.py` & `subagents.py`：
+    - `SkillManager` 与 `SubagentManager` 新增 `extra_dirs` 参数支持，无缝吸收 PluginManager 解构出的子目录路径；`SkillManager` 增强对根目录直接存在 `SKILL.md` 插件的识别加载。
+  - `agent.py` & `tasks.py`：
+    - `Agent.__init__` 新增 `plugin_dirs: Sequence[str | Path] | None = None` 参数并装配 `self.plugin_manager`，自动将插件技能与子代理注入 `SkillManager` 与 `SubagentManager`；
+    - `TaskManager._run` 在派发子代理时显式配置 `plugin_dirs=[]`，确保子代理沙箱隔离，防止递归探测产生工具冲突。
+  - `__init__.py`：导出 `Plugin`、`PluginAuthor`、`PluginManifest`、`PluginManager`。
+  - 测试：新增 `tests/test_plugins.py`（10 个测试用例，覆盖 Author 解析、Manifest 加载与多路径查找、损坏 JSON 降级推断、根级单 SKILL.md 简写、组件目录映射、PluginManager 扫描提取、Agent 自动集成与端到端 run、禁用控制、子代理派发隔离保护）。
+- **过程中的关键教训**：
+  - 规范严格性与轻量化：对标 Claude Code 官方与 OpenHands 实践，插件定位是“聚合分发包”，不额外引入重型概念；`PluginManager` 仅专注做自包含资源解构与分发，底层执行 100% 复用已有的 Skills/Subagents/MCP 机制。
+  - 递归探测防护：父 Agent 加载插件中的 `agents/*.md` 并派发子代理时，子 Agent 必须同时设置 `plugin_dirs=[]`、`subagent_dirs=[]`、`memory_dir=False`，严防子代理重新探测插件导致 `task` / `memory` 工具冲突。
+- **验证**：三包全量 **266 个离线测试** 全部 100% 绿灯通过（my-agent-core 212 + my-agent-llm 36 + my-coding-agent 18）。
+
+---
+
+### 阶段 14：Pi 风格动态干预机制（Steer 与 Follow-up）（2026-08-27）
+
+**目标**：对标 Pi 与 pig-mono，实现 `MessageQueue` 动态干预消息队列与单层 Agent 的「两层循环架构（Two-Level Loop）」，支持任务中途安全点即时转向（Steer）、最终答复期防止早退继续 ReAct、任务完成后无缝自动衔接排队追问（Follow-up），并在 `TaskManager` 中支持对运行中子代理实例的动态定向纠偏（`steer_task` / `follow_up_task`）。
+
+- 提交：`314bec1` `931cf24` `59fa538`
+- **改了什么**：
+  - `message_queue.py`（新增）：定义 `MessageType` (`STEERING`, `FOLLOWUP`)、`QueuedMessage`、`MessageQueue`，支持 `one-at-a-time`（单步推进）与 `all`（批注入）消费模式。
+  - `agent.py`：重构 `run()` 为两层循环；外层 `while True:` 驱动 Follow-up 队列与宏观任务流转，内层 `while has_more_tool_calls or len(pending_messages) > 0:` 驱动 ReAct 微观步骤与 Steer 转向；实现三大安全点（Turn 起点原子落盘、工具批执行后 Steer 检查、无工具输出期 Steer 拦截防止早退）；暴露 `steer()` / `follow_up()`（内部队列操作由 `self.message_queue` 统一管理），`abort()` 清空队列。
+  - `tasks.py`：`TaskManager` 内部维护 `_active_agents: dict[str, Agent]`，提供 `steer_task(task_id, msg)` 与 `follow_up_task(task_id, msg)`。
+  - `__init__.py`：导出 `MessageQueue`、`MessageType`、`QueuedMessage`。
+  - 测试：新增 `tests/test_message_queue.py`（5 项单测）与 `tests/test_agent_steering.py`（5 项单测），`tests/test_tasks.py` 扩充 1 项。
+- **过程中的关键教训**：
+  - 循环无限递归防范：在单测模拟 LLM 时，若流式回调在每一轮无条件调用 `steer_task` 会导致内层循环死循环；必须精准在指定轮次注入以验证多轮自动解套。
+  - 安全点落盘一致性：所有注入的 user 消息统一在内层循环起始处经由 `session.add_message("user", ...)` 原子落盘，保证了 Session 树状拓扑对干预消息的 100% 确定性可回溯。
+- **验证**：三包全量 **277 个离线测试** 全部 100% 绿灯通过（my-agent-core 223 + my-agent-llm 36 + my-coding-agent 18）。
+
+---
+
+### 阶段 15：工具系统深度优化、因果并发安全与 Tau 项目对标（2026-08-29）
+
+**目标**：对标 Pi 官方源码（第 3、5 章）与开源项目 Tau（`tau-ai`），修复 `ToolRegistry.execute_batch` 并发调度的因果时序倒置缺陷，在产品层引入 `FileMutationQueue` 细粒度单文件并发锁，全面精细化四大文件工具的错误提示与超时日志捕获，对齐每轮配对发射 `TurnEnd` 生命周期事件，并沉淀 Tau 架构深度对标报告。
+
+- **改了什么**：
+  - `registry.py`：修复 `execute_batch` 并发调度的因果时序倒置缺陷；对齐 Pi 官方的一票否决（Unanimous Parallel）机制——当且仅当整批工具均为 `is_parallel_safe=True` 时才放行 `asyncio.gather` 并发；一旦包含任何写操作，整批严格按大模型输出的原序保序串行执行，确保因果顺序绝对正确。
+  - `mutation_queue.py`（新增于 `my-coding-agent`）：引入 `FileMutationQueue`，按文件绝对路径（`path.resolve()`）管理 `asyncio.Lock` 异步互斥锁。
+  - `tools.py`（`my-coding-agent`）：
+    - `write` 和 `edit` 接入 `FileMutationQueue` 单文件锁保护，将外部并发声明提升为 `is_parallel_safe=True`（多文件并发修改耗时直降，同名文件自动保序排队）；
+    - 精细化错误文案（Prompt-Quality Errors）：`read` 增加行数统计与精准越界提示，`edit` 增加文件行数、未找到排查建议与多重匹配检测，`bash` 超时自动捕获并回显子进程已输出的最后 2000 字符日志。
+  - `context.py`：升级 compact 结构化压缩为完整的 6 Section 约束模板（`Goal`, `Constraints & Preferences`, `Progress (Done/InProgress/Blocked)`, `Key Decisions`, `Next Steps`, `Critical Context`）；新增 `extract_file_operations` 与 `format_file_operations`，自动从被压缩历史中提取并累积读改文件足迹（`<read-files>` 与 `<modified-files>`）。
+  - `agent.py`：对齐 Pi 规范，在每轮执行结束（包含纯文本答复轮）无条件成对发射 `TurnEnd(message, tool_results)` 事件，杜绝轮次悬空。
+  - `docs/references/tau-analysis.md`（新增）：深度调研与解构 Python 版 Pi Harness 开源框架 Tau（`tau-ai`），横向对比三层架构，提炼 Textual TUI、OAuth 认证链、JSONL RPC 模式、models.dev 动态模型表、`repair_tool_history` 自愈等核心亮点与演进路线。
+  - 测试：更新 `test_registry.py`（验证并发因果时序与全员并发）、`test_agent.py`（严格断言配对 `TurnEnd`）、`test_tools.py`（扩充 5 项单测覆盖文件锁并发、越界行数提示、多重匹配与超时日志捕获）、`test_context.py`（扩充 2 项单测覆盖 6 Section 约束模板与跨压缩文件足迹累积）。
+- **验证**：三包全量 **283 个离线测试** 全部 100% 绿灯通过（my-agent-core 226 + my-agent-llm 36 + my-coding-agent 21）。
+
+---
+
+### 阶段 8：统一任务系统、看板自动投影与后台异步执行（2026-08-29）
+
+**目标**：对标 Claude Code v2.1.142+（`trpc-agent-python`）、Pi（`@juicesharp/rpiv-todo`）与 `learn-claude-code`（s10/s11），构建三位一体的统一任务子系统。实现 `TaskItem` + `TaskStore` DAG 依赖状态机、标准 4 增量 CRUD 工具族（`task_create`, `task_update`, `task_get`, `task_list`）与 `todo_write` 便捷工具、`BeforeModelCall` 决策点 `<TASK_BOARD>` 上下文看板自动投影（0 工具往返消耗，Session 历史零污染），以及具备孤儿进程防御的 `BackgroundRunner` 后台异步执行引擎（`agent.abort()` 联动清理，结果自动送入 `MessageQueue` 收割）。
+
+- 提交：`307bd2e` `54fed05` `cd8a8a7` `460f992` `af30075`
+- **改了什么**：
+  - `task_store.py`（新增于 `my-agent-core`）：
+    - `TaskItem`：工单数据模型（`id`, `subject`, `description`, `status: pending/in_progress/completed/deleted`, `owner`, `active_form`, `blocked_by`, `metadata`）；
+    - `TaskStore`：管理 `<workspace>/.my_agent_core/tasks.json` 原子持久化（`tempfile` + `fsync` + `os.replace`），提供自增 ID 分配、DAG 传递性深度成环检测（`_depends_on`）、单 `in_progress` 聚焦约束、上游完成时下游 `unblocked` 自动解锁回显、全量紧凑看板渲染（`render_board`）与内部 `asyncio.Lock` 互斥保护。
+  - `tools/builtin/task_tools.py`（新增于 `my-agent-core`）：
+    - 导出 5 个标准工具：`task_create`, `task_update`, `task_get`, `task_list`, `todo_write`，全部标记 `is_parallel_safe=True`，遵循 Never-Throw 异常隔离。
+  - `background.py`（新增于 `my-agent-core`）：
+    - `BackgroundJob` & `BackgroundRunner`：异步非阻塞启动操作系统后台子进程，立即返回 `job_id`；执行完成后自动将 `<task_notification>` 送入 `agent.message_queue.add_followup()`；
+    - 孤儿进程防御：注册 `atexit` 钩子并在 `cancel_all()` / `agent.abort()` 中主动 `terminate()` 正在运行的子进程，杜绝僵尸进程。
+  - `agent.py`（`my-agent-core`）：
+    - 支持 `task_store` 参数（默认探测 `<cwd>/.my_agent_core/tasks.json`，显式指定或禁用），自动注册 `task_*` 工具；
+    - 自动装配 `self.background_runner`，并在 `abort()` 中触发后台进程安全清理；
+    - 在模型视图准备期（`BeforeModelCall` 前），若存在未完成任务，自动将 `<TASK_BOARD>` Markdown 看板注入当轮临时模型视图（Session 历史保持绝对纯净）。
+  - `tasks.py`（`my-agent-core`）：
+    - `_filter_tools` 自动过滤 `task_*` 与 `todo_write` 工具，派发子代理时显式传入 `task_store=False`，防止递归工具注册冲突。
+  - `tools.py` & `agent.py`（`my-coding-agent`）：
+    - `make_bash_tool` 支持 `run_in_background: bool = False` 参数并接入 `BackgroundRunner`；
+    - `CodingAgent` 自动装配并暴露 `task_store` 与 `background_runner` 属性。
+  - `docs/core/12-task-system-and-background.md`（新增）：沉淀统一任务系统与后台异步完整技术架构规范。
+  - 测试：
+    - `test_task_store.py`（8 项单测，覆盖 DAG 依赖、环检测、单 in_progress、解锁与原子持久化）；
+    - `test_task_tools.py`（3 项单测，覆盖 CRUD 与 todo_write 契约）；
+    - `test_task_context_projection.py`（2 项单测，验证 `<TASK_BOARD>` 自动注入与 Session 零污染）；
+    - `test_background.py`（2 项单测，验证异步启动、消息队列通知投递与取消清理）；
+    - `test_agent_task_nudge.py`（新增单测，验证模型试图输出纯文本早退时触发 Steering 提醒更新 in_progress 任务）；
+    - `test_coding_agent_tasks_e2e.py`（新增于 `my-coding-agent`，端到端验证多轮任务规划与后台测试运行）。
+- **过程中的关键教训**：
+  - 领域模型分工：彻底区分“工程规划待办实体（`TaskItem` & `TaskStore`）”与“子代理委派运行实例（`SubagentTask`）”，彻底删除旧 `tasks.py`，杜绝概念污染与命名冲突。
+  - 极简写串行化：写操作工具（`task_create`, `task_update`, `todo_write`）诚实声明 `is_parallel_safe=False`，由 `ToolRegistry` 保证严格原序串行执行，彻底免除 `TaskStore` 内部冗余互斥锁。
+  - 前缀缓存捍卫：彻底移除每轮向 System Prompt 动态拼接看板的逻辑，看板通过工具返回值即时回显，前缀缓存（Prefix Cache）100% 稳定。
+  - 任务收尾守卫：模型试图未结清退出时，框架通过 Steering 自动注入提醒，促使模型及时调用 `todo` 工具完成闭环打勾。
+  - 孤儿进程与管道悬空防御：引入 `_kill_popen_tree`（`taskkill /F /T`），彻底解决 Windows 子进程管道悬空等待导致的测试超时假死。
+- **验证**：三包全量 **304 个离线测试** 全部 100% 绿灯通过（my-agent-core 246 + my-agent-llm 36 + my-coding-agent 22）。
+
+---
+
+### 阶段 8 补充演进：TaskGuardHook 事件解耦、随路回显与 Tau 深度架构对标（2026-08-30）
+
+**目标**：消除 Agent 核心循环硬编码任务检查的分层泄漏缺陷，对齐 Pi 官方 Extension 哲学；深度探索对标 Tau（`tau_agent`）与 Pi 官方后台扩展架构，沉淀深度模块化重构规范与代码清理审查报告。
+
+- 提交：`afa9115` `ddbbe46` `6cd59d0` `e141641` `ac73711`
+- **改了什么**：
+  - `task_tools.py` & `agent.py`：将硬编码在 `Agent.run()` 中的早退催促逻辑彻底抽离，重构为独立的 `TaskGuardHook`，挂载在 `TurnEnd`（无工具调用时检查）与 `AgentStart`（清空已提醒集合）生命周期事件上，由底层消息队列安全点（`steer`）自动拉起下一轮；`Agent.run()` 核心循环回归 100% 纯净通用调度。
+  - 随路看板回显（In-Band Echo）：工具写操作在 `ToolResult.data["board"]` 中即时返回最新紧凑看板，100% 捍卫大模型供应商 Prompt Prefix Cache，Session 磁盘历史保持零污染。
+  - `docs/core/13-tau-alignment-architecture-redesign.md`（新增）：深度解构 `tau_agent`，规划 4 阶段演进路线图：
+    1. 引入 `tool_history.py` 三阶段确定性自愈状态机与 `_provider_context` 空失败轮次清洗；
+    2. 拆解 `session/` 子包（9 种多态实体、纯内存树算法防环路、`SessionState` 纯函数无锁折叠投影、纯追加 `SessionStorage`）；
+    3. 提炼 `loop.py` 纯函数微内核并暴露 `prompt_stream` 事件流；
+    4. `Agent` 消除 18 参数上帝类构造。
+  - `docs/core/14-codebase-cleanup-and-defect-repair.md`（新增）：基于双路并行 Subagent（Deslop Pass 与 Verbosity Pass）对抗式审查结论，形式化定义 P0-1（POSIX 进程组防自杀）、P0-2（`ExtensionAPI.on` 异步 Hook 协程包装）、P1-1（`context.py` 工具输出持久化重复写放大消除）、P1-2（`Tool.timeout` 接入 `asyncio.wait_for` 真实生效）等关键缺陷与修复规格。
+  - 博客更新：修润 `my-pi-agent--todolist与background.md`，理顺工具演进脉络与随路回显架构。
+- **验证**：三包全量 **304 个离线测试** 持续 100% 绿灯全通。
+
+---
+
+### 阶段 17：对话转录本自愈与断头保护引擎（对标 Tau tool_history.py）（2026-08-30）
+
+**目标**：对标 Tau `tau_agent/tool_history.py`，实现前置对话自愈纯函数模块，彻底消灭用户打断、网络超时导致的悬空断头 ToolCall 引发的大模型 API 400 校验死锁。
+
+- 提交：`580f98f`
+- **改了什么**：
+  - `tool_history.py`（新增）：定义 `ToolHistoryRepair` 结果模型与 `repair_tool_history(messages)` 纯函数，三阶段清洗算法：
+    1. 收集所有带 `tool_calls` 的 Assistant 节点并建立 `call_id` 字典索引；
+    2. 从后往前清理孤儿与重复 Tool 结果（丢弃无主结果或重复响应）；
+    3. 严格按调用声明顺序重排 Tool 结果，对缺失结果的断头调用合成为 `role="tool"` 的 `Tool call interrupted by user` 错误消息。
+  - `agent.py`：
+    - 在进入 ReAct 双层循环前，对从 Session 恢复的完整历史执行 `repair_tool_history` 自愈；
+    - 在流式接收被用户或 Hook 中止（`abort`）时，若 Assistant 消息已产生 `tool_calls`，立即为每个悬空调用生成合成中断结果并追加落盘，保证会话树拓扑时刻合法。
+  - `__init__.py`：导出 `ToolHistoryRepair` 与 `repair_tool_history`。
+  - 测试：新增 `test_tool_history.py`（8 项覆盖干净历史、悬空断头补齐、孤儿结果丢弃、乱序重排、重复清理、跨轮次同 ID 隔离、诊断报告以及 Agent 被 abort 取消后的端到端自愈恢复）。
+- **验证**：三包全量 **312 个离线测试**（core 254 + llm 36 + coding 22）100% 绿灯全通。
+
+---
+
+### 阶段 18：Tau 对齐核心框架深度重塑（session/ 拆包、纯函数 loop.py 微内核与 prompt_stream 事件流）（2026-08-30）
+
+**目标**：对标 Tau `tau_agent`，将框架核心层彻底解耦重构为工业级深度微内核架构：拆解单文件 `session.py` 为 5 专职模块并引入纯内存驱动，提炼 `run_agent_loop` 纯函数生成器微内核，将 `Agent` 瘦身为轻量 Harness 并对外暴露 `prompt_stream` 一等公民事件流与 `subscribe()` 接口。
+
+- 提交：`f9c5f03` `ba109d0` `0b90f22` `0f5dac0` `c2eac4f` `74b8c27` `dae5474` `0ea849c` `73fba0d` `a8263c2` `a9a1d60` `9a93c42` `ac89076`
+- **改了什么**：
+  - `session/` 目录结构领域下沉（拆分为 5 大专职模块）：
+    1. `entries.py`：定义 9 种多态 Pydantic v2 条目实体（`SessionInfoEntry`, `MessageEntry`, `ModelChangeEntry`, `ThinkingLevelChangeEntry`, `CompactionEntry`, `BranchSummaryEntry`, `LabelEntry`, `LeafEntry`, `CustomEntry`），通过 `Field(discriminator="type")` 组成 `SessionEntry` 联合体，彻底废除脆弱的第 0 行文件头字典；
+    2. `tree.py`：实现纯内存 DAG 算法（`entries_by_id`, `path_to_entry`, `lowest_common_ancestor`），内置 `seen` 集合循环死锁检测与重复 ID 校验，零物理 I/O 依赖；
+    3. `memory.py`：实现 `SessionState` 不可变状态快照与纯函数折叠投影（`SessionState.from_entries`），沿路径线性折叠模型、思考深度、分支指针，并自动将 `CompactionEntry` 映射为单条摘要消息；
+    4. `storage.py`：定义只追加纯异步 `SessionStorage` 协议，实现 `InMemorySessionStorage` 纯内存存储驱动，赋能单测完全脱离物理文件极速运行；
+    5. `jsonl.py`：实现 `JsonlSessionStorage` 追加存储驱动，引入 `.{name}.lock` 跨进程文件锁（Windows `msvcrt` / POSIX `fcntl`）、未完成 `.tmp` 碎片自愈清理与 `_migrate_session_entry` 旧版格式平滑兼容迁移；
+    6. `session/__init__.py`：统一子包符号导出，动态桥接向后兼容门面，确保外部老代码与现有测试零断裂。
+  - `loop.py`（新增）：
+    - 提炼纯无状态异步生成器微内核 `run_agent_loop`，全面接管 ReAct 双层事件循环（内层工具执行 + steering 即时转向，外层 follow-up 自收割），消灭原 `agent.py` 内部 260+ 行重复内联循环逻辑；
+    - 接入 `_provider_context`，在调用模型前剥离空失败轮次并串联 `repair_tool_history`，彻底免疫大模型 API 400 校验死锁；
+    - 引入 `CancellationToken` 协作式取消信号，在流式及工具调用前即刻响应中断，并自动为悬空调用合成中断结果落盘。
+  - `agent.py`：
+    - 瘦身 Agent 为轻量 Harness，将核心调度流彻底委托给 `run_agent_loop`；
+    - 暴露一等公民 `async def prompt_stream(self, user_input: str) -> AsyncIterator[Event]` 事件流接口；
+    - 暴露 `subscribe(listener)` 观察者接口；
+    - 将 `run()` 重构为纯粹消费 `prompt_stream` 的便利门面，保持原有 100% 行为兼容。
+  - 测试：新增 `test_session_tree_modular.py`（14 项）、`test_session_memory_and_storage.py`（20 项）、`test_session_jsonl_modular.py`（19 项）、`test_agent_loop_pure.py`（11 项）、扩充 `test_agent.py`（2 项），全套重构新增 66 项高质量单测。
+- **验证**：三包全量 **378 个离线测试**（core 320 + llm 36 + coding 22）100% 绿灯全通，零回归，代码检查 100% clean。
+
+---
+
+### 阶段 19：Pi 风格事件流与五大决策拦截点正交重构（2026-09-09）
+
+**目标**：彻底终结微内核单体膨胀与双发混乱，正交解耦只读事实事件流与五大决策拦截点，子生成器分治提炼，坚决拒绝冗余兼容，重写老测试，全量测试达到 392 项 100% 绿灯。
+
+- 提交：`9b585f7` `7855e7d` `e13f10f` `a0064b2` `888203a` `0cf6233` `077f45f` `d2ebf79` `b5da6b0` `bc0a5cc` `e35d2d8` `a93d108`
+- **改了什么**：
+  - `events.py` 与 `hooks.py` 架构正交解耦与物理拆分：
+    1. 彻底删除 `Interceptable` 混入类，`events.py` 纯粹承载 12 个不可变事实事件（`AgentStart`, `AgentEnd`, `TurnStart`, `TurnEnd`, `MessageStart`, `MessageUpdate`, `MessageEnd`, `ToolExecutionStart`, `ToolExecutionUpdate`, `ToolExecutionEnd`, `ContextCompacted`, `ToolsChanged`，基类 `Event`）；
+    2. 提炼独立的 `hooks.py` 物理模块，承载五大专职强类型 Hook 拦截点（`UserInputHook`, `AgentStartHook`, `BeforeModelCallHook`, `ToolCallHook`, `ToolResultHook`），专职策略拦截与参数/结果改写；
+    3. `HookRegistry` 专职负责拦截钩子的注册、注销、async/sync 回调混合调用与短路机制，内置严格的 Never-Throw 异常隔离保证，彻底废除生造的 `DecisionRegistry` 与所有 `*Decision`、`UserInput`、`BeforeModelCall`、`AgentEvent` 等兼容别名；
+    4. 扩展 `TurnEnd` 支持 `message: Message | None = None` 与 `tool_results: list[Message] = field(default_factory=list)`，并在 `AgentEnd.stop_reason` 中明确支持 `"error"` 枚举。
+  - `loop.py` 子生成器分治与状态机极简化：
+    1. 提炼 `_stream_llm`：统一归一化 `achat_stream`、`achat` 与同步 `chat`（经 `asyncio.to_thread`），消除 70 余行协议重复适配代码；
+    2. 提炼 `_assistant_turn`：专职大模型流式推理车间，逐字 yield `MessageUpdate`，精准区分 cancellation 与 error，异常时 Never-Throw 封装并于末尾 yield `MessageStart`/`MessageEnd`；
+    3. 提炼 `_synthesize_interrupted_tool_calls`：集中化断头合成自愈辅助函数；
+    4. 提炼 `_execute_tools_turn`：严格对齐 Pi 官方时序契约（Preflight 阶段按 source order **率先广播 `ToolExecutionStart`** 供 UI 即时渲染 ➔ 调用 `before_tool_call` 审批改参 ➔ 并发批处理执行 ➔ 调用 `after_tool_call` 改写 ➔ 按完成顺序发射 `ToolExecutionEnd` ➔ 按 source order 发射配对 Tool 消息事件），并在中途取消时自动自愈补齐断头调用；
+    5. 重构 `run_agent_loop`：彻底清除原本为过渡期保留的 `hook_registry` 参数与 35 行降级垫片代码，微内核纯粹瘦身为约 **110 行** 极简状态机微内核，彻底消灭 30 余处机械式双发冗余，保证在正常完成、取消中断、安全门禁阻断、最大轮次截断等任何退出路径下，已开启轮次 **100% 严格发射配对闭合的 `TurnEnd`**。
+  - `extensions/core.py` 与 `agent.py` 强类型智能路由与装配：
+    1. `ExtensionAPI.on(target)`：纯 Python 强类型自动分流：若 `issubclass(target, Event)` 则注册为只读监听器并静默忽略返回值；否则注册为拦截钩子中间件（透传 `HookResult` 干预）；
+    2. `Agent` 装配 Hook 管线：在 `prompt_stream` 起始处依次介入 `UserInputHook` 与 `AgentStartHook`，将 `before_model_call`、`before_tool_call`、`after_tool_call` 委托给 `run_agent_loop`，直接向 `self._subscribers` 单向广播事实事件；
+    3. 在 `Agent.run()` 中遇到 `event.stop_reason == "error"` 时准确向上抛出 `RuntimeError`，完整维持子代理任务失败报错契约。
+  - 单测重写与模块化分拆：
+    1. `test_events.py`（4 项覆盖 Event 不可变性、字段、TurnEnd 闭包及负向防御断言）；
+    2. `test_hooks.py`（7 项独立测试 5 大 Hook 拦截点、HookResult 字段及 HookRegistry 短路与 Never-Throw 异常捕获）；
+    3. `test_loop_subgenerators.py`（13 项覆盖协议归一化、流式推理、Pi 时序前置广播、参数结果改写与中断自愈）；
+    4. `test_agent_loop_pure.py`（14 项覆盖纯状态机微内核、门禁阻断 TurnEnd 闭环、max_iterations 截断与转向注入）；
+    5. `test_agent.py` 与 `test_extensions.py`（46 项覆盖强类型 Hook 分流与 Harness 门面）。
+- **验证**：三包全量 **389 个离线测试**（core 331 + llm 36 + coding 22）100% 绿灯全通，零回归，Primary LSP 类型检查 100% clean。
+
+---
+
+### 阶段 20：工业级七阶段工具执行流水线与订阅管道收敛（2026-09-12）
+
+**目标**：对标 Pi 工业级七阶段工具执行流水线，在 `loop.py` 微内核中引入阶段 1 截断防御（`stop_reason="length"`）、阶段 5 跨线程队列 `ToolExecutionUpdate` 实时进度流、阶段 7 `any()` 批次提前退出与 `final_text` 传递；清理 `agent.py` 遗留兼容垫片与死代码，统一收敛 `_notify` 只读事件订阅管道（完成阶段 16），并修复模型层空 `tool_calls: []` 触发 HTTP 400 隐患。
+
+- **改了什么**：
+  - `loop.py`（七阶段工具流水线落地）：
+    1. **阶段 1 截断防御（Truncation Defense）**：在 `stop_reason == "length"` 时切入 `_fail_tool_calls_from_truncated_message`，成对发射 `ToolExecutionStart`/`End(is_error=True)` 并注入错误指引，阻止残缺截断工具调用越界执行；
+    2. **阶段 2 畸形调用防崩（Error Containment）**：`_coerce_tool_call` 统一捕获工具参数序列化异常并包装为合成错误，杜绝未处理异常中断异步生成器；
+    3. **阶段 5 实时进度流（Real-time Streaming Updates）**：在 `Tool.execute` 中引入 `on_update` 回调，过滤保留参数（`_FRAMEWORK_RESERVED_PARAMS`），建立 `asyncio.Queue` 跨线程安全桥（`loop.call_soon_threadsafe` 处理 `to_thread` 同步工具），并通过 `accepting_updates` 锁存器杜绝工具结束后的迟到更新；队列生产者无条件在 `finally:` 发射 `_SENTINEL` 杜绝死锁；
+    4. **阶段 7 批次提前退出（Batch Early-Exit）**：`ToolResult` 增加 `terminate: bool = False`，`HookResult` 增加三态 `terminate: bool | None = None`；整批工具执行完毕后以 `any()` 语义评估是否熔断退出，并保证保留最后的有效终态文本 `final_text`。
+  - `agent.py`（Harness 瘦身与管道 A 闭环）：
+    1. 彻底删除零引用的死代码 `_emit`，移除死方法 `clear_queue` 与 `get_queue_status`（收敛于公开属性 `self.message_queue`）；
+    2. 清理 `compact(self)` 的死参数 `_custom_instructions`；
+    3. 将静态兼容赋值 `self.skills = self.skill_manager.list()` 重构成只读动态属性 `@property def skills`，彻底消除动态注册 skill 时的脱节隐患；
+    4. 修正构造函数 `hooks` 参数类型注解为 `list[tuple[type, Callable[..., Any]]] | None`；
+    5. 收敛 4 处重复手写的广播循环为统一的 `_notify(event)` 助手，支持同步/异步监听器，并由 `contextlib.suppress(Exception)` 彻底保障 Never-Throw 契约；
+    6. 将 `prompt_stream` 中的历史恢复统一为 `self.session.get_full_history_messages()`，避免压缩缓存节点混入空白系统消息。
+  - `my-agent-llm/providers/openai.py`：
+    - 在消息转 wire 协议时，仅在 `wire_calls` 非空时才附加 `"tool_calls"` 键，杜绝上游接口空列表 HTTP 400 校验死锁。
+  - 测试：
+    - `test_agent_loop_pure.py` 扩充截断防御、批次 `any()` 提前退出、三态 Hook 熔断与反向压制测试；
+    - `test_loop_subgenerators.py` 扩充跨线程进度流及 `Tool.execute` 锁存器 Spy 校验；
+    - `test_agent.py` 扩充 `_notify` 异步订阅者与异常隔离单测；
+    - `test_openai_provider.py` 补充空 `tool_calls` 消息转换单测。
+- **验证**：三包全量 **410 个离线测试**（core 337 + llm 51 + coding 22）100% 绿灯全通，零回归，Primary LSP 类型检查 100% clean。
+
+---
+
+## 核心演化历程总览（已全部完成落地）
+
+- 阶段 2：单层 `Agent` 类 + 事件（已完成）
+- 阶段 3：session 管理（已完成）
+- 阶段 4：context 管理（已完成）
+- 阶段 5：skill 机制（已完成）
+- subagent 机制（已完成，另列）
+- Task 委派系统 + 四个文件工具（已完成，文件工具已归位产品层）
+- 阶段 9：extension 机制与 MCP 客户端扩展（9.1/9.2/9.3 已全部完成）
+- 阶段 10：框架层原生异步架构升级（已完成）
+- 阶段 11：my-coding-agent 产品层（已完成，18 + 181 + 36 测试全绿）
+- 阶段 12：Extension 五大决策点与生命周期拦截体系（已完成，187 + 36 + 18 测试全绿）
+- 阶段 7：memory 记忆系统（已完成，201 + 36 + 18 测试全绿）
+- 阶段 13：Claude Code 风格 Plugin 插件系统（已完成，212 + 36 + 18 测试全绿）
+- 阶段 14：Pi 风格动态干预机制 Steer 与 Follow-up（已完成，223 + 36 + 18 测试全绿）
+- 阶段 8：统一 Task / Todo 系统与后台异步执行（已完成，246 + 36 + 22 = 304 测试全绿）
+- 阶段 17：对话转录本自愈与断头保护引擎（已完成，对标 Tau tool_history.py，312 测试全绿）
+- 阶段 18：Tau 对齐核心框架深度重塑（已完成，session/ 拆包、纯函数 loop.py 微内核与 prompt_stream 事件流，320 + 36 + 22 = 378 测试全绿）
+- 阶段 19：事件与拦截解耦正交重塑（已完成，纯函数微内核、强类型路由与 TurnEnd 闭合，389 测试全绿）
+- 阶段 16：事件管道 A——只读轻量事件订阅管道（`agent.subscribe` + `_notify` 异常隔离广播与 `unsubscribe()` 注销句柄，已完成）
+- 阶段 20：工业级七阶段工具流水线（截断防御、流式进度、批次熔断提前退出，410 测试全绿，已完成）
+
+---
+
+### 阶段 21：CodingAgent 产品层落地与 6 大核心文件工具（2026-09-12）
+
+**目标**：构建生产级无头编码助手 `my_coding_agent`，落地 6 大安全文件工具（`read`, `write`, `edit`, `bash`, `grep`, `find`）、`FileMutationQueue` 细粒度并发写锁、`<project_context>` 自动发现与 Dual API（`run` / `run_stream`）。
+
+- **改了什么**：
+  - `tools/base.py`：实现 `resolve_path` 兼容性路径解析与 `_safe_path` 沙箱防御，定义 `DEFAULT_IGNORE_DIRS`；
+  - `tools/read.py`：实现带行号、行/字节双重截断保护的读取工具；
+  - `tools/write.py`：由 `FileMutationQueue` 细粒度文件锁保护的原子文件写入；
+  - `tools/edit.py`：实现 Multi-Edit 与 Unified Diff 变更回显；
+  - `tools/bash.py`：跨平台进程树安全执行与超时截断；
+  - `tools/grep.py` 与 `tools/find.py`：原生跨平台正则内容与路径匹配；
+  - `mutation_queue.py`：基于 `@asynccontextmanager` 的文件级并发互斥锁；
+  - `prompt.py`：专业编码提示词装配与 `AGENTS.md` / `CLAUDE.md` 项目上下文发现；
+  - `agent.py`：`CodingAgent` 统一组装门面，提供 `run()` 与 `run_stream()` 双 API。
+- **验证**：单包 20 项新增单元与 E2E 场景测试全绿，全库 430 项测试 100% 绿灯全通。
+
+---
+
+### 阶段 22：Phase 3A Antigravity OAuth 鉴权与配额自省（2026-09-12）
+
+**目标**：对标 `pi-antigravity`，实现零硬编码密钥的 Google Cloud Code Assist OAuth 凭据自动解析与刷新，接入配额监控与多模型支持。
+
+- **改了什么**：
+  - `my_agent_llm/auth/antigravity.py`：实现 `AntigravityAuthResolver`，严格动态自省 `~/.pi/agent/auth.json` 提取 `access_token`、`refresh_token`、`project_id`，过期时通过 Google OAuth 端点自动静默刷新；
+  - `my_agent_llm/providers/antigravity.py`：实现 `AntigravityProvider`，自动注入 `Authorization`、`x-goog-user-project` 与 `User-Agent`；
+  - `my_agent_llm/auth/quota.py`：实现用户调用配额查询器 `AntigravityQuotaViewer`。
+- **验证**：全套 OAuth 解析、Token 刷新与 Provider 请求头注入测试通过，全量 505 项测试全绿。
+
+---
+
+### 阶段 23：Phase 3B Accept-on-Diff 权限审查门禁与词级 Diff 增强（2026-09-12）
+
+**目标**：对标 Pig-Mono 与 Pi，实现高危操作（写文件、命令执行）前的安全审查门禁与行内反色精细高亮。
+
+- **改了什么**：
+  - `my_coding_agent/permissions.py`：实现 `PermissionGate`，基于 `ToolCallHook` 介入写操作审查，支持 `review`、`autonomous`、`strict`、`yolo` 4 种安全模式；
+  - 词级反色差异加亮算法：字符/单词级精细 Diff 算法，直观一眼看出修改细节。
+- **验证**：多轮审查与自动放行 E2E 测试全绿，全量 535 项测试全绿。
+
+---
+
+### 阶段 24：Phase 3C 提示词 `@` 文件引用快速补全与工作区 Turnkey MCP（2026-09-12）
+
+**目标**：对标 Pig-Mono 与 Claude Code，实现提问中键入 `@file` 自动展开代码快照，大模型首轮免调 `read` 直接分析；工作区 `.mcp.json` 自动感知挂载与安全回收。
+
+- **改了什么**：
+  - `my_coding_agent/file_reference.py`：实现 `FileReferenceParser`，正则 `@([\w\-./]+\.\w+)` 匹配文件、校验边界与 2000 行/50KB 双重截断，将代码块以 `<referenced_file>` 注入提问末尾；
+  - `my_coding_agent/agent.py`：`CodingAgent` 启动时自动通过 `MCPClientManager.from_config_file()` 扫描当前工作区 `.mcp.json`，将外部工具标记 `is_mcp=True` 动态注入注册表；在 `close_mcp()` 中同时销毁子进程并从 `registry` 反注册，彻底杜绝陈旧 Schema 残留。
+- **验证**：多轮端到端直通与 MCP 挂载测试全绿，全量 565 项测试全绿。
+
+---
+
+### 阶段 25：Phase 3D 终端状态底栏 (Footer) 与流式动态转向 (LiveInputListener)（2026-09-13）
+
+**目标**：对标 Pi `footer.ts` 与 Steering 机制，提供紧凑仪表盘底栏与非阻塞键盘监听。
+
+- **改了什么**：
+  - 终端状态底栏：自动探测 Git 分支、折叠路径为 `~/...`、从会话树祖先链深度聚合实际 `total_tokens`、统计上一轮执行耗时；
+  - 键盘监听器 `LiveInputListener`：Windows `msvcrt` 与 POSIX `termios` 跨平台支持，ANSI 序列防抖，`Esc` 键瞬时掐断当前生成轮次，直接打字回车即时向 `MessageQueue` 注入 `Steering` 转向纠偏指令；
+  - `CodingAgent` 暴露 `steer()`, `follow_up()`, `abort()` 门面，通过 `main_loop.call_soon_threadsafe` 保障跨线程安全。
+- **验证**：多线程打断与 Steering 状态机测试全绿，全量 580 项测试全绿。
+
+---
+
+### 阶段 26：基于 Pi 原厂 `@earendil-works/pi-tui` 的双核表现层落地（2026-09-13）
+
+**目标**：彻底告别传统 Python 终端界面的粗糙与割裂，直接借力 Mario Zechner 调教的 Pi 原厂 TUI 引擎与成熟组件。
+
+- **改了什么**：
+  - `src/my_coding_agent/rpc_server.py`：实现 stdio JSON-RPC 2.0 服务端，将内部 `AgentEvent` 序列化为同构 JSON Lines，重构 Windows 异步 I/O 防崩溃；
+  - `tui/src/client.ts`：实现 `PythonKernelClient` 跨进程管理 Python 内核，双向管道流式传输；
+  - 移植 Pi 官方组件体系：`AssistantMessageComponent`（流式 Markdown 与思考块折叠）、`ToolExecutionComponent`（圆角细线卡片与点阵动效）、`UserMessageComponent`、`FooterComponent`、`dark.json` 24-bit TrueColor 调色盘；
+  - 消除屏幕闪烁：基于 `TuiMainScreen` 差量重绘与 CSI 2026 同步垂直刷新屏障。
+- **验证**：自动化测试覆盖组件渲染、RPC 协议收发与真实 Python 子进程端到端会话。
+
+---
+
+### 阶段 27：Tau 式单工程多包拓扑大一统重构（2026-09-13）
+
+**目标**：对标 HuggingFace 官方 Tau 架构，彻底消除“伪多包”虚拟环境分裂与跨包导包黑魔法，实现单行 `uv run pytest` 跑完全库测试。
+
+- **改了什么**：
+  - 根目录建立全局唯一的 `pyproject.toml`、`.venv` 与 `uv.lock`；
+  - 统合 Python 源码至根目录 `src/`（`my_agent_llm`, `my_agent_core`, `my_coding_agent`）；
+  - 统合测试集至根目录 `tests/`（`tests/llm`, `tests/core`, `tests/coding`）；
+  - 将前端交互层独立归位至顶级 `tui/`，根目录 `package.json` 配置 npm workspaces 支持一键 `npm start`；
+  - 在 `tui` 中接入 `CombinedAutocompleteProvider`，原生支持 `@` 工作区文件路径联想与 `/` 斜杠命令浮窗；
+  - 智能零配置凭据探测：未传 `-m` 参数时自动从 `auth.json` 挂载 `gemini-3.8-flash`。
+- **验证**：**全库 584 个测试全部 100% 绿灯全通**（Python 575 + TypeScript 9），零破坏性回归，代码已完整推送至 GitHub。
+
+---
+
+### 阶段 28：Pi 原厂运行时与交互组件 1:1 深度对齐（2026-09）
+
+**目标**：严格比对官方 Pi 系列包（`@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui`、`@earendil-works/pi-ai` 与 `pi-antigravity`），在调度、工具流水线、会话 DAG 分支、Token/成本计费以及前端交互体验上达成 1:1 像素级与行为级对齐。
+
+- **改了什么**：
+  - **补齐第 7 个内置工具 `ls`**：在 `src/my_coding_agent/tools/ls.py` 实现 `make_ls_tool`，默认 500 条目 / 50KB 双重截断保护，目录自动追加 `/` 后缀，大小写不敏感排序，支持 dotfiles 隐藏文件；
+  - **工具参数规范与模型容错对齐**：
+    - `grep`：重构入参对齐 Pi 规范，接入 `glob`、`ignore_case`、`literal`、`context` 上下文行回显与 50KB 字节截断；
+    - `edit`：对标 Pi 原厂 `prepareEditArguments`，自动反序列化 JSON 字符串与包装单 dict，杜绝格式不规范模型报错；
+    - `bash`：重构为异步行流读取，每 100ms 增量触发 `on_update` 广播，彻底告别长命令执行时的界面卡顿黑盒；
+    - `find`：限制默认 1000 项结果与 50KB 截断保护；
+  - **Antigravity 原生 SSE 直连与模型自省**：
+    - 废弃伪装的 404 OpenAI 接口，直连 Google Cloud Code Assist `v1internal:streamGenerateContent` 原生 SSE；
+    - 递归内联展开 JSON Schema 中的 `$defs` 与 `$ref`，彻底解决 Google Protobuf 400 校验死锁；
+    - 对标 `pi-antigravity/grouping.ts`，基于 Google internal API 动态发现可用模型，收敛思考后缀与别名，支持 4 小时磁盘缓存；
+  - **DeepSeek 动态模型目录**：
+    - 接入 `GET https://api.deepseek.com/models` 动态拉取模型列表并持久化 4 小时磁盘缓存，消除硬编码；
+  - **会话持久化与 DAG 分支探索**：
+    - 扩充 `SessionEntry` 支持 `SessionHeaderEntry` (`type: "session"`)、`CustomMessageEntry` 与 `modelId` / `firstKeptEntryId` 别名兼容；
+    - 修复 `/tree` DAG 图分支连接线（`│`, `├─`, `└─`）；
+    - 完整实现 `/fork`（从历史节点分叉）、`/clone`（复制当前会话全量状态）、`/resume` 下 `Ctrl+D` 二次确认删除与活跃会话安全防御（前后端双拦截）；
+  - **全量 Token 与成本核算**：
+    - 提取各 Native Provider Cache 元数据，精确计算 Prompt Cache 命中率（`CH%`）；
+    - 建立模型家族阶梯价格映射，计算美元开销与节省成本；
+    - 真实 Context Window 动态传导至双行底栏，紧凑渲染 `↑[in] ↓[out] R[read] W[write] CH[hit]% $[cost] [ctx]%/[win]`；
+  - **交互式组件与转圈动效对齐**：
+    - 实现 `CustomEditor` 继承 `Editor`，100% 对齐 Pi 原厂 `renderTopBorder` 算法，在输入框顶部边框实时嵌入高频旋转指示器（`── ⠸ Working ──`）；
+    - 实现 `WorkingStatusIndicator` 与 `CompactionStatusIndicator`，支持 80ms 高频 Braille 帧动画与 `unref` 定时器安全管理；
+    - 实现 `CompactionSummaryMessageComponent` 可折叠卡片，支持 `Ctrl+O` 展开全文 Markdown；
+    - 支持 `Shift+Tab` 与 `Ctrl+T` 快捷键轮转思考等级，自动根据模型能力动态夹逼与边框变色；
+  - **清理工程冗余**：
+    - 删除无引用的历史草稿 `docs/coding/05-pigmono-tau-feature-parity-design.md`；
+    - 删除无引用的外部重导出文件 `tui/src/interactive/components.ts` 与 `theme.ts`；
+    - 剥离 `tui/package.json` 对 `@earendil-works/pi-coding-agent` 的冗余依赖，使前端代码完全自主可控。
+- **验证**：全库测试规模提升至 **665 个 Python 核心测试全部通过**，**57 个 TUI 自动化测试全部通过**，TypeScript 编译 0 报错。
+
+---
+
+### 阶段 29：Steering 即时转向时序修复与分会话双轨制 Debug 模式（2026-09）
+
+**目标**：彻底解决运行期即时插话（Steering）在首轮启动时的时序倒挂与语义歧义，对齐 Pi 原厂 Pending 待发区呈现规范；重构 Debug 模式为“分会话独立双轨制”，实现人类可读时序与机器可读事件流的物理隔离。
+
+- **改了什么**：
+  - **Steering 交付时序对标 Pi 契约 (`src/my_agent_core/loop.py`)**：
+    - 修复了框架在 `run_agent_loop` 启动前急躁收割 Steering 消息导致初始 Prompt 与“暂停”并列输入大模型引发的歧义；
+    - 首轮推理严格专注原初任务，运行期转向指令统一在**首轮工具执行完毕后、次轮推理发起前**交付，大模型精准感知用户打断意图并立即停止。
+  - **后端 RPC 互斥锁与流式分流保护 (`src/my_coding_agent/rpc_server.py`)**：
+    - 为 `_handle_prompt` 增加 `_prompt_lock` 与 `_is_prompt_running` 状态锁，杜绝重叠请求穿透；
+    - 运行中到来的重叠 Prompt 自动识别 `streamingBehavior: "steer"` 合流至当前活跃任务的 `message_queue`；
+    - `_handle_steer` / `_handle_followup` 兼容 `{ message, prompt, text }` 任意参数名。
+  - **TUI 待发区呈现与智能插话分流 (`tui/src/interactive/interactive-mode.ts`)**：
+    - 运行期敲回车输入的普通文本默认 100% 作为 Steering 插话发送；
+    - 启用输入框上方的 `pendingMessagesContainer`，待交付插话灰显呈现为 `Steering: <内容>`，并在内核正式交付时移入主聊天区；
+    - 增加 `Alt+Up` / `Alt+Q` 快捷键，支持将排队的插话召回编辑框；
+    - 增加 `isSubmitting` 同步锁消灭毫秒级按键时间差；
+    - 修复 `message_start` 无条件追加导致普通提问气泡在屏幕上渲染两次的前端 Bug。
+  - **分会话双轨制 Debug 架构 (`paths.py`, `tracer.py`)**：
+    - 告别全局单文件混写，在 `~/.my-pi-agent/logs/<slug>-<hash>/` 下按会话隔离：
+      - `<session-id>.debug.log`：人类可读时序耗时、工具调用状态与 Token 增量；
+      - `<session-id>.events.jsonl`：对标 Pi `--mode json` 的标准机器可读不可变事件流（过滤打字机单字碎片）；
+    - 实现 `tracer.rebind()`，在会话切换（`/new`, `/resume`, `/fork`, `/clone`）时自动轮转文件句柄；
+    - 前端 `/debug` 命令联动输出当前会话的双轨日志绝对路径。
+- **验证**：Python 核心测试扩充至 **671 个全部通过**，TUI 自动化测试扩充至 **65 个全部通过**，`npm run build` TypeScript 编译 100% 成功。
+
+---
+
+### 阶段 30：Follow-up (`Ctrl+Q`) 追问全平台快捷键、全量待发消息撤回与清空队列联动（2026-09）
+
+**目标**：100% 对齐 Pi 原厂 `Ctrl+Q` Follow-up 追问规范与全量队列撤回机制，支持在智能体运行期间排队追问并在宏观任务彻底完成后自动顺延，提供 `Alt+Q`/`Alt+Up`/`Escape` 全量撤回至输入框并联动清空内核队列。
+
+- **改了什么**：
+  - **Python 内核清空队列能力 (`message_queue.py`, `agent.py`, `rpc_server.py`)**：
+    - `MessageQueue.clear()` 支持清空并返回全部被清除的排队消息；
+    - 在 `Agent` 与 `CodingAgent` 上暴露 `clear_queue()` 方法；
+    - `rpc_server.py` 增加强类型 `clear_queue` RPC 处理方法，返回 `{"cleared": true, "count": N}`。
+  - **TUI 表现层 `Ctrl+Q` Follow-up 监听与分流 (`interactive-mode.ts`)**：
+    - 全平台统一拦截 `Ctrl+Q` 快捷键：
+      - **空闲态**：等同于普通回车 `Enter`，直接作为常规 Prompt 提交执行，不进队列；
+      - **运行态**：自动提取输入框文本并追加至历史记录，加入 `pendingFollowupList`，通过 `bridge.followUp(...)` 注入内核；
+    - 待发消息区清晰渲染 `Follow-up: <内容>`，并在底部指引提示 `↳ Alt+Q to edit all queued messages`。
+  - **全量消息召回与 Escape 中断联动 (`restoreQueuedMessagesToEditor`)**：
+    - 按下 `Alt+Q` / `Alt+Up` 时，将全部排队待发消息（Steering + Follow-up）用双换行 `\n\n` 拼接一并弹回输入框，清空待发区，并同步发起 RPC `clear_queue` 清空内核排队；
+    - 按下 `Escape` 中断当前生成时，除了向内核发送 `abort` 停止流式输出外，自动联动执行全量召回，将未送出的待发排队消息无缝还原至输入框，便于用户修改重发；
+    - 在 `/hotkeys` 命令帮助清单中同步补充 `Ctrl+Q` 与 `Alt+Q/Alt+Up` 的键位说明。
+  - **TUI 客户端与桥接层扩展 (`client.ts`, `kernel-bridge.ts`)**：
+    - 在 `PythonKernelClient` 与 `KernelBridge` 中实现 `clearQueue()` 封装并覆盖完整测试用例。
+- **验证**：全库测试规模提升至 **713 个 Python 核心测试全部通过**，**68 个 TUI 自动化测试全部通过**，TypeScript 编译 0 报错。
+
+---
+
+### 阶段 31：Windows Git Bash 智能适配、退出码错误状态修复与 Esc 中断孤儿残片清理（2026-09）
+
+**目标**：彻底解决 Windows 下 bash 工具因退化至 cmd.exe 引发的 Linux 工具链失效与 GBK 乱码；修复工具非零退出码误标为成功绿勾 `✓` 的严重违和感；解决按下 Escape 中断后未完成流式助手文本（如 `"Windows"`）残留在 TUI 视口的 Bug。
+
+- **改了什么**：
+  - **Windows Git Bash 智能探查与环境对齐 (`src/my_coding_agent/tools/bash.py`)**：
+    - 对标 Pi 原厂 `getShellConfig` 策略，增加 `_resolve_shell()` 智能探测器；
+    - 优先识别用户环境变量 `PI_BASH_PATH`/`SHELL_PATH` 与 Git 常见安装目录（`D:\gitbash\Git\bin\bash.exe`, `%ProgramFiles%\Git\bin\bash.exe` 等），以 `bash.exe -c <cmd>` 模式执行；
+    - 自动注入 `LANG=C.UTF-8` 与 `LC_ALL=C.UTF-8`，并在 `_decode_stream_bytes()` 中实现“UTF-8 优先 + 本地编码防御回退”双解，彻底杜绝 Mojibake 乱码；
+    - 让大模型自然的 Linux 管道命令（`ls`, `find`, `head`, `grep` 等）在 Windows 下 100% 顺畅执行。
+  - **工具失败退出码显式判定与 TUI 红叉对齐 (`bash.py`, `ToolResult`)**：
+    - 当命令退出码 `exit_code != 0` 时，显式返回 `BashResult(ok=False, data=msg, error=msg)`；
+    - 解决旧逻辑直接返回字符串导致 `@tool` 误包装为 `ok=True` 的缺陷；
+    - 使 TUI `ToolExecutionComponent` 准确呈现红色 `✗` 与 `(失败)`，报错原文如实透传给大模型纠错。
+  - **CancellationToken 回调机制与 bash 工具瞬时中断 (`loop.py`, `bash.py`)**：
+    - 在 `CancellationToken` 中实现 `add_callback(cb)` 注册取消监听；
+    - `bash.py` 参数列表显式接入 `signal` 并在进程启动时绑定监听，用户按 Esc 时毫秒级杀死子进程树（杜绝跑 30 秒才停的体验卡顿）；
+    - 在 Git Bash 执行前置注入 `set -o pipefail`，保证管道命令（如 `pytest | tail`）中任何一步失败均能如实传递退出码；
+    - 优化工具描述明确 POSIX 语法，引导模型首轮直出标准 Linux 探测命令。
+  - **TUI 中断清理半截残片组件 (`tui/src/interactive/interactive-mode.ts`)**：
+    - 在用户按 `Escape` / `Ctrl+C` / `/abort` 中断时，立即从 `chatContainer` 中将正在流式的半截 `currentStreamingAssistant` 安全移除并置空；
+    - 在 `message_end` 与 `agent_end` 中拦截 `stop_reason === "cancelled" / "aborted"`，彻底杜绝已被丢弃的孤儿单字在视口中新建气泡；
+    - 确保 `执行已中断。` 通知在清爽的界面中规范呈现。
+- **验证**：全库测试规模提升至 **717 个 Python 核心测试全部通过**，**69 个 TUI 自动化测试全部通过**，TypeScript 编译 0 报错。
+
+---
+
+### 阶段 32：大模型智能重试体系、TUI 异常加固、凭据热重载与无界循环演进（2026-09-25，v0.1.1 发布）
+
+**目标**：彻底解决大模型在握手阶段 401 报错被前端桥接层吞噬以及空数组 `[].trim()` 崩溃引发的转圈指示器永久冻结 Bug；依据 Pi 原厂规范实现 ReAct 微内核级智能退避重试体系；支持 `/reload` 与 `/login` 活跃凭据原地热更新；彻底移除 `max_iterations` 人为硬编码步数限制，正式发布 `v0.1.1`。
+
+- **改了什么**：
+  - **TUI 交互与异常防御全面加固 (`my-pi-tui/`)**：
+    - `event-translator.ts`：在 `message_end` 时若未收到流式 Chunk 但服务端返回了错误正文，补齐文本块并忠实透传 `metadata` 与 `stopReason`，不再吞噬握手期报错；`agent_end` 补充透传 `final_text`；
+    - `assistant-message.ts`：`setContent` 与 `appendTextDelta` 增加严格类型收敛，安全解析 `string`、`ContentBlock[]` 数组或对象，杜绝非字符串调用 `.trim()` 抛出致命异常；
+    - `interactive-mode.ts`：在 `agent_end` 中引入 `try...finally`，确保转圈动效与忙碌标志 `isBusy: false` 100% 能够清场复位。
+  - **大模型智能退避重试体系 (`my_agent_core/retry.py` & `loop.py`)**：
+    - 实现 `AutoRetryPolicy`，严格区分 429/5xx/网络断流（自动重试）与 400/401/403/配额耗尽（立即熔断）；
+    - 采用带 Jitter 抖动的指数退避算法，并优先尊重服务端回传的 `Retry-After` / `retry-after-ms` 响应头；
+    - 广播 `AutoRetryStart` 与 `AutoRetryEnd` 事实事件，TUI 边框呈现实时重试倒计时（`── ⠸ 重试中 (1/3) 2.0s 后继续 ──`）并支持 `Esc` 毫秒级即时中断。
+  - **凭据热重载与原地无感刷新 (`rpc_server.py`)**：
+    - `/reload` 自动重新载入 `AuthManager`，并原地重新绑定当前活跃的 LLM 实例，外部修改 `auth.json` 即可一键生效；
+    - `/login <provider> <key>` 绑定凭据后，若当前正在使用该 Provider，当场原地热更新内存中的模型客户端，无需重启或切模型。
+  - **彻底移除最大循环步数 (`max_iterations`) 限制**：
+    - 从 `run_agent_loop` 与 `Agent` 移除 `max_turns` / `max_iterations` 参数及轮次熔断截断分支，使 ReAct 循环完全由模型自身决策和用户取消信号主导；
+    - 清理关联事件与子代理的残留参数，遵循《测试冲突重写原则》彻底删除老旧测试用例。
+- **验证**：全库测试规模达到 **725 个 Python 核心测试全部通过**，**71 个 TUI 自动化测试全部通过**（共 796 测试），正式发布 npm 与 GitHub Release `v0.1.1`。
+
+---
+
+### 阶段 33：Pi 原厂工具提示词自声明体系演进（<tools>, <rules>, <cwd> 与动态条件互斥）（2026-09-25）
+
+**目标**：彻底解决工具规则集中硬编码导致的第三方工具规则缺失问题；依据 Pi 原厂 `system-prompt.js` 规范，实现“工具自声明（Tool-as-a-Contributor）”架构；生成结构化 `<tools>` 动作索引、`<rules>` 动态决策准则与 `<cwd>` POSIX 工作区标签；支持子代理工具提示词动态裁切。
+
+- **改了什么**：
+  - **Tool 类与 @tool 装饰器支持提示词自声明 (`my_agent_core/tools/core.py`)**：
+    - 新增 `prompt_snippet`（一句话概要）与 `prompt_guidelines`（规则清单）属性；
+    - 实现自动首句摘要回退机制（若未传 snippet，自动从 `description` 截取第一句，既轻量又免去强制编写负担）。
+  - **工具提示词格式化器实现 (`my_agent_core/tools/prompt.py`)**：
+    - `format_tools_section`：动态遍历活跃工具生成 `<tools>` 动作清单，末尾附加扩展说明；
+    - `format_rules_section`：收集各工具 guidelines 并全局去重，内建条件互斥（当且仅当无专用 `grep/find/ls` 时才注入 bash 查找说明），注入通用底线准则；
+    - `format_cwd_section`：生成对标 SFT 训练特征的标准 `<cwd>` POSIX 斜杠工作区标签。
+  - **7 大核心编码工具注入规则声明 (`src/my_coding_agent/tools/`)**：
+    - `read` 注入 `"Use read to examine files instead of cat or sed."`；
+    - `edit` 注入 4 条原子替换与最小唯一匹配准则；
+    - `write` 注入 `"Use write only for new files or complete rewrites."`；
+    - `bash` 注入环境变量自省说明；`grep/find/ls` 注入精简 snippet。
+  - **重构 build_default_coding_prompt 提示词装配 (`src/my_coding_agent/prompt.py`)**：
+    - Preamble 升级为 Pi 官方标准；
+    - 将 `<tools>`、`<rules>`、`<cwd>` 与 `<project_context>` 模块化组装，删除原冗余硬编码大段规则。
+  - **CodingAgent 与 Subagent 提示词全链路打通 (`agent.py`, `subagent_tasks.py`)**：
+    - `CodingAgent` 在构造 `Agent` 前预先组装好全量工具，使首条系统提示词完整融合 7 大工具及额外工具；
+    - `subagent_tasks.py` 在 `_system_for` 中动态根据子代理过滤后的 `child_tools` 生成专属 `<tools>` 与 `<rules>`（只读子代理自动剥离 `edit`/`write` 规则）。
+- **验证**：全库测试规模提升至 **739 个 Python 核心测试全部通过**，**71 个 TUI 自动化测试全部通过**（共 810 测试，100% 绿灯全通）。
+
+---
+
+### 阶段 34：Herdr 跨窗口端到端（E2E）全量真机测试与压缩切点 API 400 免疫自愈（2026-09-26）
+
+**目标**：通过 Herdr Multiplexer 建立左右双 Pane 真实端到端集成测试流水线；左侧作为主控与质量工程师，右侧作为真实生产态 `my-pi-agent` TUI；在真实终端与实际 API 调用环境下执行包含 10 大场景的全面体检，并就地捕获并修复历史深水区 Bug。
+
+- **改了什么**：
+  - **完成 10 大全量端到端测试用例 (TC-01 ~ TC-10)**：
+    - **TC-01（基础对话与思考流）**：验证自然语言问答流式输出，`Ctrl+O` 展开/折叠思考过程气泡；
+    - **TC-02（只读工具检索）**：验证 `grep` 定位 `AutoRetryPolicy` 源码并调用 `read` 读取展示，完成多步 ReAct 闭环；
+    - **TC-03（写操作沙箱闭环）**：验证 `write` 创建计算器与 pytest 测试、`bash` 跑测、`edit` 精准修改、多工具并行执行，以及面对路径 import 异常时的自主自愈与彻底 tearDown 清理；
+    - **TC-04（工具异常与错误自愈）**：验证读取不存在文件与非零退出码命令时，`status=ERROR` 如实回传且 Never-Throw 保证成立，模型自主进行架构分析；
+    - **TC-05（运行时动态 Steering 插话）**：验证在 Agent 耗时生成途中从外部注入指令，消息在轮次边界精准出队，Agent 毫秒级掉头改写小绝句；
+    - **TC-06（实时 Esc 中断与清场复位）**：验证在命令执行途中注入 `Esc`，实现毫秒级取消、清理半截气泡并复位输入框；
+    - **TC-07（斜杠命令系统）**：验证 `/help` 自动弹出补全菜单、`/compact` 触发强制摘要并折叠、`/clear` 清屏重置；
+    - **TC-08（多轮会话树与代词记忆）**：验证多轮对话代词指代（代号记忆）、读取穿插与跨轮状态保持；
+    - **TC-09（双轨日志与事件流核对）**：白盒核验 `.debug.log`、`.events.jsonl` 与会话树 JSONL 记录的严格一致性；
+    - **TC-10（极限压力与字符转义）**：验证含有嵌套引号、反引号、JSON 符号与 Emoji 的极端输入在 JSON-RPC 与终端解析中零崩溃。
+  - **定位并根治压缩切点漂移引发的 API 400 严重 Bug (`agent.py`, `context.py`, `loop.py`, `tool_history.py`)**：
+    - **根因分析**：当会话中存在被中断取消的无效轮次时，`_provider_context` 会将其剥离，导致微内核看到的干净消息条数小于 `self.messages`；而在手动 `/compact` 时以未清洗的消息数记录了 `covered_count`，使下轮切片 `start` 越过新用户指令，只取到了随后的工具执行结果，生成了首项为 `role="tool"` 的孤儿消息视图，触发 DeepSeek/OpenAI `Messages with role 'tool' must be a response to a preceding message with 'tool_calls'` 400 报错。
+    - **三层递进防御重塑**：
+      1. 在 `Agent.prompt_stream` 与 `Agent.compact` 中统一引入 `clean_provider_context`，保证无论会话历史如何重放或中断，进入压缩管线的消息基底与微内核完全对齐；
+      2. 在 `ContextManager._build_cached_view` 中为 `start` 切点注入 `_snap_cut_to_group`，从机制上杜绝切点落在 `tool` 或 `assistant(tool_calls)` 内部；
+      3. 在 `run_agent_loop` 准备完 `view` 之后增加 `view = _provider_context(view)` 双保险，确保送入任何大模型 Provider 的消息列表 100% 经过合法拓扑闭合检验。
+- **验证**：编写 `tests/core/test_compaction_orphan_tool_prevention.py` 回归测试，全库测试规模提升至 **742 个 Python 核心测试全部通过**，**71 个 TUI 自动化测试全部通过**（共 813 测试，100% 绿灯全通）。在右侧真实 TUI 中重放测试，400 报错彻底消失，压缩后多轮调用完美通过。
+  - **完成第二阶段 6 大深度特性与极限边界测试 (TC-11 ~ TC-16)**：
+    - **TC-11（巨量输出与工具输出落盘截断）**：注入 2500 行大量输出，系统触发 50KB 字节级与尾部保留截断，落盘完整日志并注入恢复路径，TUI 视口流畅无死锁；
+    - **TC-12（会话树分支拓扑与可视化）**：验证 `/tree` 弹出交互式 DAG 树选择器，`/fork` 从历史消息创建平行会话分支并克隆会话文件；
+    - **TC-13（会话隔离与全新生命周期）**：验证 `/new` 优雅结束旧会话、清空 Token/内存状态并开辟空白会话；验证 `/session` 打印结构化元数据，`/resume` 弹出带范围过滤的历史会话选择器；
+    - **TC-14（动态技能机制）**：验证 `/skill:test-helper` 宏展开与系统提示词注入，Agent 完整执行技能 SOP 指令；
+    - **TC-15（宏观排队追问）**：验证 `/followup` 在上一轮任务执行期间排队，待 `AGENT_END` 后自动无缝接力执行，与 `/steer` 的轮次边界插话严格解耦；
+    - **TC-16（高频并发连击与防抖压力）**：1 秒内快速连击 3 条指令，RPC 服务端与前端 `isSubmitting` 锁严格按 FIFO 顺序排队执行，零死锁、零倒序。
+
+---
+
+### 阶段 35：全系统 50 轮全景端到端真机集成测试收官与终极报告交付（2026-09-27）
+
+**目标**：继续以 Herdr 跨窗口双 Agent 协作方式，完成剩余 34 轮深度测试，累计达到 50 轮全景集成体检；覆盖高级输入预处理、持久化记忆、思维预算、任务看板、断电恢复、子代理防递归、权限审查门禁、细粒度文件并发锁与多 Provider 适配；遵循 TDD 消除深水区 Bug，产出《50轮全景集成体检终极报告》。
+
+- **改了什么**：
+  - **完成第三阶段高级子系统测试 (TC-17 ~ TC-22)**：
+    - **TC-17（@ 文件直通快照）**：`UserInputHook` 拦截并在后台提取源码快照注入 `<referenced_files>`，大模型 0 次工具调用首轮准确解析；不存在文件优雅透传；
+    - **TC-18（持久化记忆系统）**：`memory(action="add")` 以 `utf-8-sig` 和 `\n§\n` 原子落盘，跨 `/new` 全新会话在系统提示词自动注入 `<MEMORY_CONTEXT>`；`remove` 唯原子串移除并复位；
+    - **TC-19（思考预算热切换）**：`/thinking` 弹出 ANSI 菜单，`Shift+Tab` 免弹窗热循环（off/low/medium/high），状态栏联动显示；
+    - **TC-20（任务看板 DAG 依赖与成环拦截）**：深度优先遍历拦截循环依赖返回 `Cycle detected`；
+    - **TC-21（文件损坏容错与掉电恢复）**：会话 JSONL 追加截断破损行，`Session.load()` 宽容丢弃残片并无损恢复前面 60 条合法历史；
+    - **TC-22（空闲与执行中连续 Esc 压力）**：空闲连击零异常，执行中连击毫秒级触发 `cancelled`，无悬挂僵尸子进程。
+  - **完成第四阶段架构极限与全景集成测试 (TC-23 ~ TC-50)**：
+    - **TC-23 ~ TC-26（子代理委托与防递归）**：父代理派发 `task`，子代理在 `<session_dir>/subagents/` 独立落盘执行；子代理工具集严格剔除 `task` 工具且 `subagent_dirs=[]`，杜绝循环递归；子代理独立会话隔离；
+    - **TC-27 ~ TC-30（PermissionGate 审查门禁）**：`review` 模式拦截 `write`/`edit` 高危写操作并提供 Diff 预览；只读工具安全免批放行；审批被拒后模型自主自愈并换路；`yolo` 模式全静默放行；
+    - **TC-31 ~ TC-33（FileMutationQueue 并发文件锁）**：单文件写操作严格串行互斥；多文件修改非阻塞并发并行；异常中断锁安全释放防死锁；
+    - **TC-34 ~ TC-37（MCP 扩展协议）**：启动期自动扫描 `.mcp.json`；stdio JSON-RPC 通信调用；智能体退出时外部 MCP 子进程树彻底回收清理；子服务崩溃隔离容错；
+    - **TC-38 ~ TC-41（多 Provider 适配与参数同步）**：Anthropic Wire 格式转换与工具块组装；DeepSeek/OpenAI 思考增量流式解析；Antigravity 专有 SSE 事件反序列化；切模型后上下文窗口 `set_budget` 与 Schema 自动同步；
+    - **TC-42 ~ TC-45（上下文压缩极端边界）**：消息裁切保留组边界；旧工具结果微压缩保留 metadata；工具输出持久化到磁盘生成摘要；compact 逼近阈值时携带旧摘要递进式迭代再摘要；
+    - **TC-46 ~ TC-50（会话回溯护栏、多工具调度与全景体检终极验收）**：禁止 rewind 越过 `compaction_floor`；`TaskGuardHook` 任务看板未完成提醒；单轮只读工具并行、写工具串行混合调度；异常中断下会话落盘一致性；全库 745 个 Python 测试与 71 个 TUI 测试大回归全绿。
+  - **定位并根治子代理 Frontmatter YAML 列表解析 Bug (`src/my_agent_core/subagents.py`)**：
+    - **根因分析**：`parse_frontmatter` 将 YAML 列表强转为 `str`（`"['read', 'grep']"`），`_split_csv` 逗号切割后导致工具名变成了带括号和单引号的畸形文本（`"['read'"`），使白名单匹配失效，子代理可用工具被清空。
+    - **就地修复**：重写 `_split_csv`，原生兼容 Python list/tuple/set、带引号括号的字符串 repr 及标准 CSV 字符串，精准剥离符号还原合法名称，并补充测试用例。
+  - **增强 TaskStore 原子依赖挂载能力 (`task_store.py` & `task_tools.py`)**：
+    - `TaskStore.create` 与 `todo` 工具原生支持 `blocked_by` 字段，实现创建任务即原子挂载前置依赖，并补齐测试用例。
+  - **编写全景报告 (`docs/coding/10-50-round-e2e-inspection-report.md`)**：
+    - 详尽复盘 50 轮测试矩阵、缺陷根因分析、三层防御实现与核心架构不变式审核结论。
+- **验证**：全库测试规模提升至 **745 个 Python 核心测试全部通过**，**71 个 TUI 自动化测试全部通过**（共 816 测试，100% 绿灯全通）。
+
+---
+
+### 阶段 36：工具执行期输出定型截断与上下文前缀一致性重构（2026-10-09）
+
+**目标**：彻底解决滑动窗口上下文压缩导致的 Prompt Cache 击穿痛点，对齐 Pi 原厂机制重塑工具输出定型截断与 Append-Only 离散 Epoch 块级压缩管线。
+
+- **改了什么**：
+  - **工具执行期 50KB / 2000 行输出定型截断 (`src/my_agent_core/tools/core.py`)**：
+    - 对标 Pi 原厂 `truncate.ts`，实现 `truncate_tool_output`（`DEFAULT_TOOL_MAX_BYTES = 50 * 1024`，`DEFAULT_TOOL_MAX_LINES = 2000`）；
+    - 在 `ToolResult.serialize()` 阶段统一实施定型截断并附加行数与字节统计 Notice；
+    - 输出写入消息历史即为不可变事实，彻底消除在后续轮次中回溯篡改历史工具消息的破坏性逻辑。
+  - **废除逐轮 L1/L2 滚动篡改，确立 Append-Only 前缀一致性 (`src/my_agent_core/context.py`)**：
+    - 废除在每轮 `prepare()` 中执行的 L1 中间轮次滚动裁切与 L2 历史工具滚动占位篡改；
+    - 确立 Append-Only 原则：在未超出 80% 水位线门控前，传给大模型的 View 严格保持只读追加，历史前缀 100% 字节不变，最大化利用现代大模型服务端 KV-Cache。
+  - **动态 80% 水位线管控与离散 Epoch 块级压缩 (`context.py`)**：
+    - `budget_threshold = (budget * 4) // 5`：未超 80% 门控原样返回；超限时触发离散 Epoch 块压缩；
+    - 门控触发后优先尝试工具输出持久化到磁盘；若仍超限，花费 1 次 LLM API 执行 compact 结构化摘要；
+    - 摘要生成后建立全新稳定基准前缀：`[System, [Context summary], *retained_tail]`，后续轮次在该基准上继续 Append-Only 累积；
+    - 维持双标签 `<analysis>` / `<summary>` 防注入与 6 Section 约束，并累积 `<read-files>` / `<modified-files>` 全生命周期文件操作足迹。
+  - **编写前缀稳定性与仿真验证测试 (`tests/core/test_context.py`)**：
+    - 新增 `test_discrete_epoch_compaction_establishes_stable_prefix` 验证离散块压缩确立稳定基准前缀；
+    - 新增 `test_100_turns_prefix_stability_simulation` 验证百轮长会话仿真中除离散切换点外前缀分叉数恒为 0。
+- **验证**：全库测试全部通过，长会话多轮前缀稳定性达 100%，消除孤儿工具调用与切点漂移。
+
+---
+
+### 阶段 37：Harbor 评测子系统 `my-pi-eval` 建设与 Terminal-Bench 2.1 突破 80.90% 胜率（2026-10-09）
+
+**目标**：构建标准 Harbor 评测适配器，在真实 Docker 沙箱基准集 Terminal-Bench 2.1 上展开全量攻坚，验证框架在长任务系统工程、复杂编译排错与高频工具交互下的端到端实战性能与前缀缓存命中率。
+
+- **改了什么**：
+  - **实现 Scheme 1 宿主驱动型 `MyPiAgent` 适配器 (`my-pi-eval/src/my_pi_eval/agent.py`)**：
+    - 继承 Harbor 官方 `harbor.agents.base.BaseAgent` 接口，支持原生 `harbor run` 与自定义 CLI 统一驱动；
+    - 采用宿主机编排架构：Agent 内核与 LLM 直连留在宿主机，通过 Docker 管道驱动沙箱，容器免安装 Node.js/npm 环境，冷启动从 2.5 分钟缩减至 **< 2 秒**。
+  - **严格评测凭据隔离 (`resolve_eval_llm`)**：
+    - 严格禁止读取本地 `~/.my-pi-agent/auth.json`，仅允许通过系统环境变量或专属 `my-pi-eval/.env` 获取 API Key，彻底杜绝沙箱逃逸泄漏风险。
+  - **高保真沙箱工具桥接层 (`my-pi-eval/src/my_pi_eval/tools.py`)**：
+    - `HarborToolRegistry` 将 7 大工作区工具桥接至容器：`bash` 超时熔断与 50KB 截断、`write` 自动 CRLF ➔ LF 规范化、`edit` 宿主单义性校验与原子替换、`read`/`grep`/`find`/`ls` 容器实时检索。
+  - **Session 文件全量 Token 指标采集与缓存核算 (`agent.py`)**：
+    - 从持久化 `session.jsonl` 转录本逐条提取 `prompt_tokens`、`completion_tokens` 与 `cache_read_tokens`，输出标准 `metrics.json`；
+    - 真实核算前缀缓存命中率：实测 `build-cython-ext` 复杂编译任务斩获 **96.7% Cache Hit Rate**。
+  - **Terminal-Bench 2.1 全量 89 题终局攻坚**：
+    - 攻克 Docker 虚拟网桥 IP 池耗尽、Debian 官方源 502、Commander.js CLI `--` 越界与官方动态配时四大工程陷阱；
+    - 在 89 道真实环境 Linux 赛题中斩获 **72 胜 / 80.90% 绝对胜率**（底座大模型：DeepSeek-V4.1-Flash），攻克 `gpt2-codegolf` (1614万 Tokens)、`torch-pipeline-parallelism`、`compile-compcert`、`fix-ocaml-gc` 等地狱级题目，突破 80% 行业关键大关。
+- **验证**：新增 `tests/eval/` 单元测试套件（18 个测试全部通过），全库 Python 离线测试规模达 **773 个测试全部通过**（前端 71 个测试全绿，总计 844 个自动化测试 100% 绿灯）。
+
+---
+
+### 阶段 38：Terminal-Bench 2.1 终局战报定格 (71胜/83.53%)、全链路极简重构、垫片彻底拔除与安全加固（2026-10-11，v0.2.0 发布）
+
+**目标**：定格 Terminal-Bench 2.1 历史性终局战报；依照 Pi/Tau 核心架构规范与《代码简化与反模式消除指南》，全盘拔除所有历史兼容别名与垫片；消除巨石类与深层穿透；加固命令链与文件并发安全；完成双端全量质量门禁验证（814 Python 测试 + 80 TUI 测试全绿），正式发布 `v0.2.0`。
+
+- **改了什么**：
+  - **Terminal-Bench 2.1 终局战报与可视化体系定格**：
+    - 严谨剔除原厂 Pi 72 胜中的自研 Agent 误统计胜场，校准原厂基准为 59 胜 / 66.29%（有效分母 85）；
+    - 自研 MyPiAgent 斩获 **71 胜 / 83.53% 胜率**（底座 DeepSeek-V4.1-Flash），全面反超原厂 Pi；
+    - 在 README 中集成 15 篇架构与实战长文专栏导航、九大实战暗坑归纳、对比矩阵与高清战报图表资产。
+  - **彻底拔除历史兼容垫片与死代码 (`src/my_agent_core/`, `src/my_coding_agent/`, `my-pi-tui/`)**：
+    - 移除 `_provider_context` 别名垫片，微内核直接使用 `clean_provider_context`；
+    - 移除 `make_task_tools` 残留垫片与 6 个空壳结果子类 (`ReadResult` 等)，统一收敛为 `StringCompatibleToolResult`；
+    - 移除 `edit` 工具已废弃的扁平 `old_text`/`new_text` 兼容入参；
+    - 移除 `SessionStore.create_session()` 与 `open_session()` 废弃方法；
+    - 移除 `CompactionEntry` 伪装成 `Message` 的 `role`/`content` 鸭子类型属性，条目回归纯净 `summary`；
+    - 消除 `ModelChangeEntry` 与 `SessionInfoEntry` 镜像字段及双向同步验证器，由单一规范字段与 alias 驱动，净化 JSONL 序列化；
+    - 拔除 `rpc_server.py::__all__` 中 13 个虚假重导出别名，彻底收敛为 `__all__ = ["RpcServer"]`。
+  - **TUI 交互巨石类模块化与命令分发表改造 (`my-pi-tui/`)**：
+    - 将 1938 行巨石类 `interactive-mode.ts` 解耦拆分为 `selector-manager.ts` (457行)、`history-renderer.ts` (250行) 与 `event-dispatcher.ts` (316行)；
+    - 将 500 行 switch 阶梯的 `slash-commands.ts` 彻底重构为声明式 `COMMAND_DISPATCH: Record<string, SlashCommandHandler>` 分发表模式；
+    - 移除 `footer.ts` 中的 `tokensUsed` 历史冗余字段。
+  - **架构深层穿透消除与元数据自愈**：
+    - 为 `CodingAgent` 注入门面代理属性（`llm`, `model`, `messages`, `context_manager`, `registry`, `message_queue` 等），彻底消除 40+ 处 `server.agent.agent.*` 深层穿透；
+    - 为 `loop.py` 工具执行、截断失败与合成中断全面注入 `tool_name` 元数据；
+    - `AntigravityProvider` 强化工具结果反向回查 `tool_name` 自愈，杜绝盲目回退为 `"tool"`；
+    - 统一模型配置与 RPC 响应为 `contextWindow`，消除历史 `context_window` 杂音；
+    - 标准化导出全量 14 类核心生命周期事件（包含 `AutoRetryStart`, `AutoRetryEnd`）。
+  - **核心安全与并发加固**：
+    - 命令链注入防护：转义分号、管道符与反引号，阻断命令注入风险；
+    - 宏文件路径穿越防御：强制白名单检验与绝对路径限制；
+    - `AuthManager` 引入跨线程细粒度 `FileLock`，保障凭据读写并发安全；
+    - 健全后台任务 `BackgroundJob` 强引用防止被事件循环过早 GC；
+    - 修复 Anthropic 并发工具结果未合并导致的 API 报错。
+- **验证**：
+  - Python 全量自动化测试：**814 passed** (`pytest`)，零失败；
+  - 前端 TUI 自动化测试：**80 passed, 0 failed, 1 skipped** (`npm test`)；
+  - 前端 TypeScript 编译：`npm run build` 0 错误；
+  - Pyright 静态类型分析：`0 errors, 0 warnings`；
+  - Ruff 代码规范：`All checks passed!`。
+  - 正式发布 `v0.2.0`。
+
+
+
+
+
+
+
+
+
+

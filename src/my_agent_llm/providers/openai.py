@@ -1,0 +1,380 @@
+# pyright: reportArgumentType=false, reportCallIssue=false
+"""OpenAI provider：基准实现，deepseek 以此为模板。"""
+
+import inspect
+import json
+from collections.abc import AsyncIterator, Iterator
+
+import openai
+
+from ..config import Config
+from ..models import Message, Response, StreamChunk, ToolCall
+from ._base import Provider
+
+
+class _ToolCallAccumulator:
+    """聚合流式 tool_calls 增量片段，产出统一形状。
+
+    OpenAI 兼容流式把 tool_call 分片送达：id/name 只出现一次，
+    arguments 是碎片 JSON 字符串，按 index 键控拼接。
+    """
+
+    def __init__(self) -> None:
+        self._by_index: dict[int, dict[str, str]] = {}
+
+    def add(self, delta) -> None:
+        """消费一个 delta 的 tool_calls 片段。"""
+        for tc in getattr(delta, "tool_calls", None) or []:
+            index = getattr(tc, "index", 0) or 0
+            slot = self._by_index.setdefault(index, {"id": "", "name": "", "arguments": ""})
+            if getattr(tc, "id", None):
+                slot["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    slot["name"] = fn.name
+                if getattr(fn, "arguments", None):
+                    slot["arguments"] += fn.arguments
+
+    def finish(self) -> list[ToolCall] | None:
+        """流式结束：产出完整 tool_calls（无则 None）。"""
+        if not self._by_index:
+            return None
+        out: list[ToolCall] = []
+        for _, slot in sorted(self._by_index.items()):
+            raw_args = slot["arguments"]
+            args = {}
+            error = None
+            try:
+                if raw_args.strip():
+                    parsed = json.loads(raw_args)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                    else:
+                        error = f"Tool arguments must be a dict, got {type(parsed).__name__}"
+            except Exception as exc:
+                error = f"Malformed JSON arguments: {exc}"
+            out.append(
+                ToolCall(
+                    id=slot["id"],
+                    name=slot["name"],
+                    args=args,
+                    error=error,
+                )
+            )
+        return out
+
+
+class OpenAIProvider(Provider):
+    """OpenAI provider 实现。"""
+
+    def __init__(self, config: Config, client=None, async_client=None):
+        """初始化。client/async_client 可注入（测试缝隙）。"""
+        self.config = config
+        if client is not None or async_client is not None:
+            self.client = client
+            self.async_client = async_client
+            return
+        kwargs = {
+            "api_key": config.api_key,
+            "timeout": config.timeout,
+            "max_retries": config.max_retries,
+        }
+        if config.base_url:
+            kwargs["base_url"] = config.base_url
+        self.client = openai.OpenAI(**kwargs)
+        self.async_client = openai.AsyncOpenAI(**kwargs)
+
+    def _convert_messages(self, messages: list[Message]) -> list[dict]:
+        """Message → OpenAI wire dict。"""
+        result = []
+        for msg in messages:
+            content = msg.content if isinstance(msg.content, str) else [
+                part if part["type"] == "text" else {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{part['mime_type']};base64,{part['data']}"},
+                }
+                for part in msg.content
+            ]
+            if msg.role in ("system", "developer"):
+                result.append({"role": msg.role, "content": msg.text_content})
+            elif msg.role == "assistant" and msg.metadata and "tool_calls" in msg.metadata:
+                wire_calls = []
+                for tc in msg.metadata["tool_calls"]:
+                    if isinstance(tc, ToolCall):
+                        wire_calls.append(tc.to_wire_dict())
+                    elif isinstance(tc, dict):
+                        if "function" in tc:
+                            wire_calls.append(tc)
+                        else:
+                            wire_calls.append(ToolCall.model_validate(tc).to_wire_dict())
+                if wire_calls:
+                    result.append(
+                        {
+                            "role": "assistant",
+                            "content": content or None,
+                            "tool_calls": wire_calls,
+                        }
+                    )
+                else:
+                    result.append({"role": "assistant", "content": content or ""})
+            elif msg.role == "tool" and msg.metadata:
+                result.append(
+                    {
+                        "role": "tool",
+                        "content": msg.text_content,
+                        "tool_call_id": msg.metadata.get("tool_call_id", ""),
+                    }
+                )
+            else:
+                result.append({"role": msg.role, "content": content})
+        return result
+
+    @staticmethod
+    def _extract_tool_calls(message) -> list[ToolCall] | None:
+        """从 OpenAI 响应 message 提取 tool_calls（统一形状）。"""
+        if not getattr(message, "tool_calls", None):
+            return None
+        out: list[ToolCall] = []
+        for tc in message.tool_calls:
+            fn = getattr(tc, "function", None)
+            name = getattr(fn, "name", "") if fn else ""
+            raw_args = getattr(fn, "arguments", "{}") if fn else "{}"
+            args = {}
+            error = None
+            try:
+                if isinstance(raw_args, str) and raw_args.strip():
+                    parsed = json.loads(raw_args)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                    else:
+                        error = f"Tool arguments must be a dict, got {type(parsed).__name__}"
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+            except Exception as exc:
+                error = f"Malformed JSON arguments: {exc}"
+            out.append(
+                ToolCall(
+                    id=getattr(tc, "id", ""),
+                    name=name,
+                    args=args,
+                    error=error,
+                )
+            )
+        return out
+
+    @staticmethod
+    def _extract_usage(response) -> dict[str, int] | None:
+        """从响应或流式 chunk 提取完整 usage（含 OpenAI & DeepSeek 真实 Prompt Cache）。"""
+        u = getattr(response, "usage", None)
+        if u is None:
+            return None
+
+        prompt_tokens = getattr(u, "prompt_tokens", 0) or 0
+        completion_tokens = getattr(u, "completion_tokens", 0) or 0
+        total_tokens = getattr(u, "total_tokens", 0) or (prompt_tokens + completion_tokens)
+
+        # 1. 提取 OpenAI 官方 Prompt Cache (prompt_tokens_details.cached_tokens) 与 DeepSeek 专用 Cache
+        cache_read = 0
+        try:
+            details = getattr(u, "prompt_tokens_details", None)
+            if details is not None:
+                if isinstance(details, dict):
+                    cache_read = int(details.get("cached_tokens", 0) or 0)
+                else:
+                    cache_read = int(getattr(details, "cached_tokens", 0) or 0)
+
+            if not cache_read:
+                hit = getattr(u, "prompt_cache_hit_tokens", None)
+                if hit is not None:
+                    cache_read = int(hit or 0)
+                elif isinstance(u, dict):
+                    cache_read = int(u.get("prompt_cache_hit_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            cache_read = 0
+
+        # 计算净非缓存输入量
+        net_prompt = max(0, prompt_tokens - cache_read) if prompt_tokens >= cache_read else prompt_tokens
+
+        out = {
+            "prompt_tokens": net_prompt,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+        if cache_read > 0:
+            out["cache_read_tokens"] = cache_read
+        return out
+
+    def chat(
+        self,
+        messages: list[Message],
+        *,
+        model: str,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> Response:
+        """同步对话。"""
+        if self.client is None:
+            raise RuntimeError("client not provided; cannot run sync methods")
+        response = self.client.chat.completions.create(  # pyright: ignore[reportCallIssue, reportArgumentType]
+            model=model,
+            messages=self._convert_messages(messages),
+            tools=tools,
+            **kwargs,
+        )
+        choice = response.choices[0]
+        return Response(
+            content=choice.message.content or "",
+            model=response.model,
+            usage=self._extract_usage(response),
+            finish_reason=choice.finish_reason,
+            tool_calls=self._extract_tool_calls(choice.message),
+        )
+
+    def stream(
+        self,
+        messages: list[Message],
+        *,
+        model: str,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> Iterator[StreamChunk]:
+        """同步流式：逐 delta 产文本块；流式结束补发末块（完整 tool_calls + usage）。"""
+        if self.client is None:
+            raise RuntimeError("client not provided; cannot run sync methods")
+        stream = self.client.chat.completions.create(  # pyright: ignore[reportCallIssue, reportArgumentType]
+            model=model,
+            messages=self._convert_messages(messages),
+            tools=tools,
+            stream=True,
+            **kwargs,
+        )
+        accumulator = _ToolCallAccumulator()
+        text_acc = ""
+        usage = None
+        final_finish_reason: str | None = None
+        for chunk in stream:
+            chunk_usage = self._extract_usage(chunk)
+            if chunk_usage:
+                usage = chunk_usage
+            if not chunk.choices:
+                continue  # usage-only 末块（choices 为空）——usage 已捕获，流式结束
+            choice = chunk.choices[0]
+            if choice.finish_reason:
+                final_finish_reason = choice.finish_reason
+            delta = choice.delta
+            accumulator.add(delta)
+            if reasoning_delta := getattr(delta, "reasoning_content", None):
+                yield StreamChunk(
+                    content="",
+                    metadata={"reasoning_content": reasoning_delta},
+                    finish_reason=choice.finish_reason,
+                )
+            if getattr(delta, "content", None):
+                text_acc += delta.content
+                yield StreamChunk(content=delta.content, finish_reason=choice.finish_reason)
+        tool_calls = accumulator.finish()
+        final_response = Response(
+            content=text_acc,
+            model=model,
+            tool_calls=tool_calls,
+            usage=usage,
+            finish_reason=final_finish_reason,
+        )
+        yield StreamChunk(
+            content="",
+            tool_calls=tool_calls,
+            usage=usage,
+            finish_reason=final_finish_reason,
+            response=final_response,
+        )
+
+    async def achat(
+        self,
+        messages: list[Message],
+        *,
+        model: str,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> Response:
+        """异步对话。"""
+        if self.async_client is None:
+            raise RuntimeError("async_client not provided; cannot run async methods")
+        response = await self.async_client.chat.completions.create(  # pyright: ignore[reportCallIssue, reportArgumentType]
+            model=model,
+            messages=self._convert_messages(messages),
+            tools=tools,
+            **kwargs,
+        )
+        choice = response.choices[0]
+        return Response(
+            content=choice.message.content or "",
+            model=response.model,
+            usage=self._extract_usage(response),
+            finish_reason=choice.finish_reason,
+            tool_calls=self._extract_tool_calls(choice.message),
+        )
+
+    async def achat_stream(
+        self,
+        messages: list[Message],
+        *,
+        model: str,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[StreamChunk]:
+        """异步流式：逐 delta 产文本块；流式结束补发末块（完整 tool_calls + usage）。"""
+        if self.async_client is None:
+            raise RuntimeError("async_client not provided; cannot run async methods")
+        stream = await self.async_client.chat.completions.create(  # pyright: ignore[reportCallIssue, reportArgumentType]
+            model=model,
+            messages=self._convert_messages(messages),
+            tools=tools,
+            stream=True,
+            **kwargs,
+        )
+        accumulator = _ToolCallAccumulator()
+        text_acc = ""
+        usage = None
+        final_finish_reason: str | None = None
+        try:
+            async for chunk in stream:
+                chunk_usage = self._extract_usage(chunk)
+                if chunk_usage:
+                    usage = chunk_usage
+                if not chunk.choices:
+                    continue  # usage-only 末块（choices 为空）——usage 已捕获，流式结束
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    final_finish_reason = choice.finish_reason
+                delta = choice.delta
+                accumulator.add(delta)
+                if reasoning_delta := getattr(delta, "reasoning_content", None):
+                    yield StreamChunk(
+                        content="",
+                        metadata={"reasoning_content": reasoning_delta},
+                        finish_reason=choice.finish_reason,
+                    )
+                if getattr(delta, "content", None):
+                    text_acc += delta.content
+                    yield StreamChunk(content=delta.content, finish_reason=choice.finish_reason)
+        finally:
+            if hasattr(stream, "close") and inspect.iscoroutinefunction(stream.close):
+                await stream.close()
+            elif hasattr(stream, "response") and hasattr(stream.response, "aclose"):
+                await stream.response.aclose()
+        tool_calls = accumulator.finish()
+        final_response = Response(
+            content=text_acc,
+            model=model,
+            tool_calls=tool_calls,
+            usage=usage,
+            finish_reason=final_finish_reason,
+        )
+        yield StreamChunk(
+            content="",
+            tool_calls=tool_calls,
+            usage=usage,
+            finish_reason=final_finish_reason,
+            response=final_response,
+        )
