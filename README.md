@@ -1,7 +1,5 @@
 # my-pi-agent
 
-> 当前仓库已精简，保留了本页原有的介绍与展示。下文的测试数量、测试命令、评测结果及完整目录树为清理前版本的记录；相关技术文档和评测报告链接指向该历史版本。
-
 <p align="center">
   <img src="docs/assets/banner.png" alt="my-pi-agent — a minimalist Python coding-agent harness with 1:1 Pi-TUI terminal presentation" width="100%" />
 </p>
