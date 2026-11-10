@@ -1,7 +1,6 @@
 # pyright: reportUnusedImport=false, reportMissingTypeArgument=false
 """Context 管理：离散 Epoch 块级压缩管线（Cache-Friendly & Append-Only）+ usage 锚定估算。
 
-设计文档：docs/core/05-context-compaction.md。
 本模块遵循只读追加与前缀不变性规范，保障大模型 KV-Cache（Prompt Cache）高命中率。
 本模块只做"视图变换"（非破坏，绝不修改传入 list）；树/文件由 Session 管。
 """

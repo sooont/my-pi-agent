@@ -1,8 +1,0 @@
-{
-  "$schema": "https://raw.githubusercontent.com/davidmreed/pi-lens/main/rules/ast-grep-rules/rule-schema.json",
-  "rules": {
-    "ast-grep-policy": {
-      "disable": ["no-boolean-in-except"]
-    }
-  }
-}

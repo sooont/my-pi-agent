@@ -6,7 +6,6 @@ build-backend = "hatchling.build"
 name = "my-pi-agent"
 version = "0.2.0"
 description = "Minimalist Pi-style coding-agent framework and CLI with Pi-TUI"
-readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "openai>=2.50.0",
@@ -17,6 +16,7 @@ dependencies = [
     "pyyaml>=6.0",
     "mcp>=2.0.0,<2.1",
     "filelock>=3.32.6",
+    "pillow>=10.0",
 ]
 
 [project.scripts]
@@ -24,11 +24,7 @@ my-pi-agent = "my_coding_agent.cli:main"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0,<10.0",
-    "anyio>=4.0",
     "ruff>=0.16.7",
-    "matplotlib>=3.11.2",
-    "numpy>=2.4.6",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -37,11 +33,6 @@ packages = [
     "src/my_agent_core",
     "src/my_coding_agent",
 ]
-
-[tool.pytest.ini_options]
-pythonpath = ["src", "my-pi-eval/src", "."]
-testpaths = ["tests"]
-addopts = "-ra -q --import-mode=importlib"
 
 [tool.ruff]
 target-version = "py311"
@@ -52,4 +43,4 @@ select = ["E", "F"]
 ignore = ["E501"]
 
 [tool.pyright]
-extraPaths = ["src", "my-pi-eval/src", "."]
+extraPaths = ["src", "."]
